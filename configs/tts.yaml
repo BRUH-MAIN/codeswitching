@@ -1,0 +1,32 @@
+# Stage 2: Indic Parler-TTS synthesis.
+#
+# The paper synthesises with "one Indian male and one Indian female voice".
+# The model card's recommended Hindi speakers are Rohit and Divya.
+#
+# parler-tts hard-pins transformers==4.46.1. That is a resolver constraint, not
+# a warning. Install it before importing transformers.
+
+model: ai4bharat/indic-parler-tts   # gated: accept terms on the Hub first
+dtype: float16
+device: cuda:0
+
+speakers: [Rohit, Divya]            # assigned 50/50 by sha1(sent_id), NOT hash()
+batch_size: 8                       # length-sorted buckets keep padding down
+seed: 1234
+
+# The model emits 22.05 kHz; Whisper wants 16 kHz.
+source_sr: 22050
+target_sr: 16000
+
+# Sharding: a 12h Kaggle session that dies costs at most one shard.
+num_shards: 4
+
+subsets:
+  train_t2_hours: 22.0
+  train_t1_hours: 8.0               # strict subset of T2, stored BY REFERENCE
+
+# GATE 2 targets
+expect:
+  t2_hours: 22.0
+  t1_hours: 8.0
+  t1_subset_of_t2: true

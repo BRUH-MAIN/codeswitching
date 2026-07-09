@@ -1,0 +1,26 @@
+# M7 (Track 2): whisper-small fine-tuned on Train_T2 (22h synthetic).
+# Paper: MER 40.8, CBA-HE 52.3, CBA-EH 55.x
+#
+# Identical to M6 except the full synthetic set is used (no subset_ids).
+# Expected: ~15% relative MER improvement over M6.
+
+model: openai/whisper-small
+out: exp/m7
+
+train_hf: RohanRamesh/hi-en-synth-cs
+train_config: synth_t2
+subset_ids: null
+
+dev_hf: RohanRamesh/mucs-he-cs
+dev_config: dev
+
+language: hi
+
+lr: 2.0e-5
+batch_size: 16
+grad_accum: 4
+max_steps: 5000
+warmup_steps: 200
+eval_steps: 250
+patience: 4
+seed: 1234

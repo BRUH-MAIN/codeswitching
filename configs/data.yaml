@@ -1,0 +1,43 @@
+# Stage 0: corpora and the HF repos we publish to.
+
+mucs:
+  # OpenSLR 104, CC BY-SA 4.0. The trmal mirror is password-free.
+  base_url: https://openslr.trmal.net/resources/104
+  raw_dir: data/raw
+  extract_dir: data/mucs
+  # Track 2 never trains on real code-switched audio, so the 89.8h train split
+  # is prepared TEXT-ONLY. Only the 4h dev slice and the 5.2h test set get cut.
+  train_text_only: true
+  dev_hours: 4.0
+  seed: 1234
+
+common_voice:
+  # mozilla-foundation/common_voice_17_0 was emptied in Oct 2025 when Mozilla
+  # moved Common Voice to the Mozilla Data Collective. This is the CC0 mirror.
+  #
+  # We do NOT use load_dataset on it: its loading script declares a `variant`
+  # column its own TSVs lack, so streaming dies with "column names don't match"
+  # (and loading scripts were removed in datasets>=4). prepare_cv.py reads the
+  # repo layout directly and streams the tars, aborting at the hour target.
+  repo: fsicoli/common_voice_17_0
+  langs: [hi, en]
+  hours_per_lang: 15.0
+  # Smallest metadata first. en/dev alone holds ~50 h with a 4.9 MB tsv, so
+  # en/train (45 GB audio, 363 MB tsv) is never touched. hi needs dev+test+train
+  # to reach 15 h (only ~20.6 h exists).
+  splits: [dev, test, train, other]
+  max_per_speaker: 200          # 0 disables; keep generous or hi starves at 15 h
+  audio_root: data/cv
+
+audio:
+  sampling_rate: 16000
+  subtype: PCM_16          # never float32: 22h float32 = 7 GB, int16 = 2.5 GB
+  min_dur: 0.5
+  max_dur: 30.0            # Whisper's receptive window
+
+hub:
+  user: RohanRamesh
+  real_repo: RohanRamesh/mucs-he-cs        # private: derivative of a challenge corpus
+  synth_repo: RohanRamesh/hi-en-synth-cs
+  private: true
+  max_shard_size: 500MB

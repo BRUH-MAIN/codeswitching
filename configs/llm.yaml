@@ -1,0 +1,45 @@
+# Stage 1: LLM few-shot generation.
+#
+# DEVIATION D1 from the paper, which used Llama-3.3-70B-Instruct (141 GB bf16).
+# Llama-3.1-8B-Instruct is the nearest same-family model with official Hindi
+# support and fits a 16 GB T4 under bitsandbytes NF4.
+#
+# Why not vLLM: its AWQ kernels require compute capability >= 8.0. The T4 is
+# sm75 and raises "quantization method awq is not supported for the current GPU".
+
+backend: transformers
+model: meta-llama/Llama-3.1-8B-Instruct
+# Ungated mirror if you would rather not accept Meta's license:
+#   model: unsloth/Meta-Llama-3.1-8B-Instruct
+load_in_4bit: true
+dtype: float16        # T4 is Turing: no bf16
+
+bigrams:
+  n_calls: 4466              # 4466 x 10 ~= the paper's 44,657 raw bigrams
+  bigrams_per_call: 10
+  sentences_per_prompt: 5    # paper: "batches of five Hindi-English sentences"
+  temperature: 0.9
+  max_new_tokens: 200
+  batch_size: 16
+
+translation_check:
+  items_per_call: 20         # batched so this stage does not dominate the budget
+  n_samples: 3               # self-consistency: an 8B judge is noisier than a 70B
+  temperature: 0.7
+  batch_size: 8
+
+sentences:
+  temperature: 0.8
+  max_new_tokens: 256
+  batch_size: 16
+  max_chars: 400             # Whisper's label cap is 448 tokens
+
+cache_dir: data/llm_cache    # every call is cached: the run survives a 12h timeout
+seed: 1234
+
+# GATE 1 targets (paper §3.2.1-3.2.2)
+expect:
+  raw_bigrams: 44657
+  unique_bigrams: 5932       # 13.3% survive dedup
+  valid_bigrams: 5477        # 92.3% of unique survive filtering
+  sentences: 16000           # from a theoretical 5477 x 4 = 21,908

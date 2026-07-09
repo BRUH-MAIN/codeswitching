@@ -1,0 +1,32 @@
+# M8 (Track 2): Train_T2 (22h synthetic) + Common Voice monolingual (15h hi + 15h en).
+# Paper: MER 39.2, CBA-HE 55.4, CBA-EH 56.x
+#
+# 52h of audio total. Still a SINGLE <|hi|> prompt for everything -- language-
+# specific prompting is Track 1's M4, not Track 2.
+#
+# Expected: ~4% relative MER improvement over M7.
+
+model: openai/whisper-small
+out: exp/m8
+
+train_hf: RohanRamesh/hi-en-synth-cs
+train_config: synth_t2
+subset_ids: null
+
+extra_hf:
+  - RohanRamesh/mucs-he-cs:cv_hi
+  - RohanRamesh/mucs-he-cs:cv_en
+
+dev_hf: RohanRamesh/mucs-he-cs
+dev_config: dev
+
+language: hi
+
+lr: 2.0e-5
+batch_size: 16
+grad_accum: 4
+max_steps: 5000
+warmup_steps: 200
+eval_steps: 250
+patience: 4
+seed: 1234

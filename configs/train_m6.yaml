@@ -1,0 +1,31 @@
+# M6 (Track 2): whisper-small fine-tuned on Train_T1 (8h synthetic).
+# Paper: MER 48.2, CBA-HE 45.5, CBA-EH 45.x  (with whisper-large-v2)
+#
+# DEVIATION D2: whisper-small (244M) not large-v2 (1.54B). Absolute MER will be
+# much higher; the claim under test is the M6 > M7 > M8 ordering.
+#
+# The paper's optimizer recipe is kept intact (D3): full fine-tune, AdamW,
+# lr 2e-5, effective batch 64. whisper-small fits a T4 with ~4 GB of optimizer
+# state, so no LoRA and no quantization are needed.
+
+model: openai/whisper-small
+out: exp/m6
+
+train_hf: RohanRamesh/hi-en-synth-cs
+train_config: synth_t2
+subset_ids: t1_ids.json          # <- what makes this M6 rather than M7
+
+dev_hf: RohanRamesh/mucs-he-cs
+dev_config: dev
+
+language: hi                     # <|hi|> prompt for all of M6/M7/M8, per Table 2
+
+lr: 2.0e-5
+batch_size: 16
+grad_accum: 4                    # 16 x 4 = 64 effective, the paper's batch
+max_steps: 5000
+warmup_steps: 200
+eval_steps: 250
+patience: 4                      # ~16k utts at batch 64 is 250 steps/epoch;
+                                 # 5k steps would be 20 epochs, so we early-stop
+seed: 1234

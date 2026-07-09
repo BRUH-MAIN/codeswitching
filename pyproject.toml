@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "csasr"
+version = "0.1.0"
+description = "Replication of Track 2 of Biswas et al. (Interspeech 2025): Hindi-English code-switched ASR via LLM-synthesised data"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "soundfile>=0.12",
+    "librosa>=0.10",   # datasets 3.x decodes the Audio feature via librosa+soundfile
+    "soxr>=0.3",       # 22.05kHz (Parler-TTS) / 48kHz (Common Voice) -> 16kHz
+    "jiwer>=3.0",
+    "tqdm>=4.66",
+    "rich>=13.0",
+    "omegaconf>=2.3",
+    "huggingface_hub>=0.24",
+    # datasets >= 4.0 decodes the Audio feature through torchcodec, which needs a
+    # matching torch + ffmpeg and is absent from stock Kaggle images. The 3.x line
+    # decodes with soundfile, which we already depend on.
+    "datasets>=3.0,<4.0",
+]
+
+# Kept deliberately light so `pip install git+...` on Kaggle is fast.
+# Heavy / conflicting deps live in extras.
+[project.optional-dependencies]
+# Local stage 0 is CPU-only: no torch. soundfile reads MUCS wav and Common Voice
+# mp3 (libsndfile >= 1.1); soxr does the 48k -> 16k resample.
+local = ["requests>=2.31", "soxr>=0.3"]
+llm = ["llama-cpp-python>=0.3.0"]
+tts = ["transformers==4.46.1", "parler-tts"]   # parler-tts hard-pins transformers; NEVER install with `train`
+train = ["transformers>=4.49", "accelerate>=1.1", "evaluate>=0.4", "tensorboard"]
+dev = ["pytest>=8.0", "torch", "transformers>=4.49", "accelerate>=1.1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
