@@ -57,7 +57,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dev-hf", default=None)
     ap.add_argument("--dev-config", default="dev")
     ap.add_argument("--dev-manifest", type=Path, default=None)
-    ap.add_argument("--hf-token", default=None)
+    # Never pass a token in argv: it lands in every traceback and in `ps` output.
+    ap.add_argument("--hf-token", default=None, help="prefer the HF_TOKEN env var")
 
     # paper's recipe
     ap.add_argument("--lr", type=float, default=2e-5)
@@ -75,6 +76,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--report-to", default="auto", help="'auto' uses tensorboard if installed")
     args = ap.parse_args(argv)
 
+    import os
+
     import torch
     from transformers import (
         EarlyStoppingCallback,
@@ -88,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
     from ..eval.cba import cba
     from ..eval.mer import mer
     from .collator import WhisperCollator
+
+    hf_token = args.hf_token or os.environ.get("HF_TOKEN")
 
     if not torch.cuda.is_available():
         print("[train] WARNING: no CUDA device; this will be unusably slow")
@@ -106,7 +111,7 @@ def main(argv: list[str] | None = None) -> int:
     # ---- data ----------------------------------------------------------
     def _load(hf, cfg, manifest, split="train"):
         if hf:
-            return load_hub_dataset(hf, cfg, split=split, token=args.hf_token)
+            return load_hub_dataset(hf, cfg, split=split, token=hf_token)
         if manifest:
             return load_manifest_dataset(manifest)
         return None
@@ -120,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
     extras = []
     for spec in args.extra_hf:
         repo, _, cfg = spec.partition(":")
-        extras.append(load_hub_dataset(repo, cfg or None, token=args.hf_token))
+        extras.append(load_hub_dataset(repo, cfg or None, token=hf_token))
     extras += [load_manifest_dataset(p) for p in args.extra_manifest]
     if extras:
         train = concat([train, *extras])

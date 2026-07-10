@@ -120,7 +120,7 @@ AUDIO = WORK / "audio";    AUDIO.mkdir(parents=True, exist_ok=True)
 
 def run(*args):
     print(">", " ".join(str(a) for a in args), flush=True)
-    subprocess.run([sys.executable, "-m", *args], check=True)
+    subprocess.run([sys.executable, "-m", *args], check=True)   # inherits HF_TOKEN
 
 !nvidia-smi --query-gpu=name,memory.total --format=csv
 """),
@@ -197,7 +197,7 @@ gc.collect(); torch.cuda.empty_cache()
 if STAGE in ("text", "both"):
     for man, cfg in [("bigrams_valid.jsonl", "bigrams"), ("sentences.jsonl", "sentences")]:
         run("csasr.data.push_to_hub", "--manifest", MAN / man,
-            "--repo", SYNTH_REPO, "--config", cfg, "--text-only", "--token", HF_TOKEN)
+            "--repo", SYNTH_REPO, "--config", cfg, "--text-only")
 """),
 
     md("## 6 · Stage 2b — synthesize audio\n\nIndic Parler-TTS, Rohit (male) / Divya (female) 50/50. Emits 22.05 kHz → resampled to 16 kHz, written as int16 (float32 would be 7 GB).\n\nSharded: rerun this cell after a timeout and it skips whatever already exists."),
@@ -246,7 +246,7 @@ for voice in ("Rohit", "Divya"):
     md("## 8 · Push the synthetic corpus\n\nParquet + FLAC ≈ 1.4 GB (vs 2.5 GB as WAV). The round-trip check catches a corrupted upload *before* a 3h training run."),
     code("""
 run("csasr.data.push_to_hub", "--manifest", MAN / "train_t2.jsonl",
-    "--repo", SYNTH_REPO, "--config", "synth_t2", "--token", HF_TOKEN, "--verify")
+    "--repo", SYNTH_REPO, "--config", "synth_t2", "--verify")
 
 from huggingface_hub import HfApi
 HfApi().upload_file(path_or_fileobj=str(WORK / "t1_ids.json"),
@@ -294,9 +294,11 @@ from pathlib import Path
 os.environ["HF_HOME"] = "/kaggle/temp/hf"
 
 from kaggle_secrets import UserSecretsClient
-HF_TOKEN = UserSecretsClient().get_secret("HF_TOKEN")
+# Token goes in the environment, never in argv (it leaks into every traceback).
+os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
 from huggingface_hub import hf_hub_download, login
-login(token=HF_TOKEN)
+login(token=os.environ["HF_TOKEN"])
+HF_TOKEN = os.environ["HF_TOKEN"]   # for load_dataset / hf_hub_download only
 
 SYNTH = "RohanRamesh/hi-en-synth-cs"
 REAL  = "RohanRamesh/mucs-he-cs"
@@ -314,7 +316,7 @@ t1_ids = hf_hub_download(SYNTH, "t1_ids.json", repo_type="dataset", token=HF_TOK
     code("""
 run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/smoke",
     "--train-hf", SYNTH, "--train-config", "synth_t2",
-    "--dev-hf", REAL, "--dev-config", "dev", "--hf-token", HF_TOKEN,
+    "--dev-hf", REAL, "--dev-config", "dev",
     "--max-steps", "20", "--eval-steps", "10", "--dataset-fraction", "0.01",
     "--batch-size", "4", "--grad-accum", "1")
 """),
@@ -323,7 +325,7 @@ run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/smo
     code("""
 run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/m6",
     "--train-hf", SYNTH, "--train-config", "synth_t2", "--subset-ids", t1_ids,
-    "--dev-hf", REAL, "--dev-config", "dev", "--hf-token", HF_TOKEN,
+    "--dev-hf", REAL, "--dev-config", "dev",
     "--lr", "2e-5", "--batch-size", "16", "--grad-accum", "4",
     "--max-steps", "5000", "--eval-steps", "250", "--patience", "4")
 """),
@@ -332,7 +334,7 @@ run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/m6"
     code("""
 run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/m7",
     "--train-hf", SYNTH, "--train-config", "synth_t2",
-    "--dev-hf", REAL, "--dev-config", "dev", "--hf-token", HF_TOKEN,
+    "--dev-hf", REAL, "--dev-config", "dev",
     "--lr", "2e-5", "--batch-size", "16", "--grad-accum", "4",
     "--max-steps", "5000", "--eval-steps", "250", "--patience", "4")
 """),
@@ -342,7 +344,7 @@ run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/m7"
 run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/m8",
     "--train-hf", SYNTH, "--train-config", "synth_t2",
     "--extra-hf", f"{REAL}:cv_hi", f"{REAL}:cv_en",
-    "--dev-hf", REAL, "--dev-config", "dev", "--hf-token", HF_TOKEN,
+    "--dev-hf", REAL, "--dev-config", "dev",
     "--lr", "2e-5", "--batch-size", "16", "--grad-accum", "4",
     "--max-steps", "5000", "--eval-steps", "250", "--patience", "4")
 """),
@@ -380,68 +382,110 @@ makes every downstream result uninterpretable.
 
 Then decode M6/M7/M8 and the `whisper-small` zero-shot baseline they are measured against.
 
-Decoding uses `language=None` (Whisper auto-detect), reproducing WhisperX's "None"
-option from the paper. That is the whole point: a model that has not learned
-code-switching mis-detects the language and then transliterates or deletes.
+### Decoding reproduces WhisperX, not a per-clip loop
+The paper decodes whole recordings with WhisperX. We use **faster-whisper**, the engine
+WhisperX wraps: language detected **once per recording**, 30-second chunks with real
+context, beam 5, VAD, temperature fallback, and a compression-ratio threshold that aborts
+repetition loops.
+
+This matters enormously. Decoding the 3,136 isolated 6-second clips instead makes Whisper
+render English loanwords in Devanagari, so the hypothesis contains **no script boundary and
+no switch bigram can match**. Measured on real test audio with one model:
+
+| decoding | %Latin in hyp | MER | CBA-HE |
+|---|---|---|---|
+| reference | 21.6% | – | – |
+| per-clip | **0.0%** | 182.6 | 0.0 |
+| recording-level | 12.2% | 103.1 | 1.6 |
+
+`utt_id` is `<speaker>_<recording>_<index>`, so the `test` config already on the Hub is
+regrouped into its 30 recordings here — no re-upload.
 """),
 
     code(f"""
 !pip install -q git+{REPO}
-!pip install -q -U transformers jiwer
+!pip install -q -U transformers jiwer faster-whisper ctranslate2
 !pip install -q "datasets<4" librosa soundfile   # see 02_train: torchcodec
 
 import os, subprocess, sys
 os.environ["HF_HOME"] = "/kaggle/temp/hf"
+
 from kaggle_secrets import UserSecretsClient
-HF_TOKEN = UserSecretsClient().get_secret("HF_TOKEN")
-from huggingface_hub import login; login(token=HF_TOKEN)
+# Put the token in the ENVIRONMENT, never in argv: a CLI arg lands verbatim in
+# every traceback and in `ps` output.
+os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
+from huggingface_hub import login; login(token=os.environ["HF_TOKEN"])
 
 REAL = "RohanRamesh/mucs-he-cs"
 OUT  = "/kaggle/working"
 
 def run(*args):
     print(">", " ".join(str(a) for a in args), flush=True)
-    subprocess.run([sys.executable, "-m", *args], check=True)
+    subprocess.run([sys.executable, "-m", *args], check=True)   # inherits HF_TOKEN
+
+!nvidia-smi --query-gpu=name,memory.total --format=csv
 """),
 
-    md("## GATE 3 — calibrate the metric against a published number"),
+    md("## GATE 3 — calibrate the metric against a published number\n\nInference only. ~15 min on a T4 (30 recordings, not 3,136 clips)."),
     code("""
 run("csasr.eval.decode", "--model", "openai/whisper-large-v2",
-    "--test-hf", REAL, "--test-config", "test", "--hf-token", HF_TOKEN,
-    "--out", f"{OUT}/hyp_largev2_zeroshot.jsonl", "--batch-size", "8")
+    "--engine", "faster-whisper", "--mode", "recording", "--language", "none",
+    "--test-hf", REAL, "--test-config", "test",
+    "--out", f"{OUT}/hyp_largev2_zeroshot.jsonl",
+    "--refs-out", f"{OUT}/refs_recording.jsonl")
 """),
 
     code("""
-import json
-from datasets import load_dataset
-from csasr.manifest import write_jsonl
 from csasr.eval.score import score
 
-test = load_dataset(REAL, "test", split="train", token=HF_TOKEN)
-write_jsonl(f"{OUT}/refs_test.jsonl",
-            [{"utt_id": r["utt_id"], "text": r["text"]} for r in test])
-
 for mode in ("word", "hybrid"):
-    res = score(f"{OUT}/refs_test.jsonl", f"{OUT}/hyp_largev2_zeroshot.jsonl", mer_mode=mode)
+    res = score(f"{OUT}/refs_recording.jsonl", f"{OUT}/hyp_largev2_zeroshot.jsonl", mer_mode=mode)
     print(f"MER mode={mode:<7} -> MER {res['mer']:.1f}   CBA-HE {res['cba_he']:.1f}   CBA-EH {res['cba_eh']:.1f}")
 
 print("\\npaper (large-v2 zero-shot): MER 52.0   CBA-HE 42.9   CBA-EH 36.x")
 print("Whichever mode lands near 52.0 is the definition the authors used.")
+print("\\nIf MER is far from 52 or CBA-HE far from 42.9, STOP. Do not generate data")
+print("against a ruler that does not reproduce a published number.")
+"""),
+
+    code("""
+# Sanity: the hypotheses must carry BOTH scripts, or CBA is structurally zero.
+from csasr.manifest import read_jsonl
+from csasr.lid import Lang, count_words
+from csasr.normalize import normalize
+
+def mix(t):
+    c = count_words(normalize(t, "scoring")); tot = sum(c.values()) or 1
+    return c[Lang.HI] / tot, c[Lang.EN] / tot
+
+refs = {r["utt_id"]: r["text"] for r in read_jsonl(f"{OUT}/refs_recording.jsonl")}
+hyps = list(read_jsonl(f"{OUT}/hyp_largev2_zeroshot.jsonl"))
+rh, re_ = mix(" ".join(refs.values()))
+hh, he = mix(" ".join(h["hyp"] for h in hyps))
+print(f"REFERENCE : {rh:5.1%} Devanagari  {re_:5.1%} Latin")
+print(f"HYPOTHESIS: {hh:5.1%} Devanagari  {he:5.1%} Latin")
+print("detected languages:", {h["detected_language"] for h in hyps})
 """),
 
     md("## whisper-small zero-shot — the actual baseline for M6/M7/M8"),
     code("""
 run("csasr.eval.decode", "--model", "openai/whisper-small",
-    "--test-hf", REAL, "--test-config", "test", "--hf-token", HF_TOKEN,
-    "--out", f"{OUT}/hyp_small_zeroshot.jsonl", "--batch-size", "16")
+    "--engine", "faster-whisper", "--mode", "recording", "--language", "none",
+    "--test-hf", REAL, "--test-config", "test",
+    "--out", f"{OUT}/hyp_small_zeroshot.jsonl")
 """),
 
-    md("## Decode the fine-tuned models"),
+    md("""## Decode the fine-tuned models
+
+`decode.py` converts each HF checkpoint to CTranslate2 on first use and caches it, so
+faster-whisper can load it. Run this **only after** `02_train.ipynb` has pushed the repos."""),
     code("""
 for m in ("m6", "m7", "m8"):
     run("csasr.eval.decode", "--model", f"RohanRamesh/whisper-small-cs-{m}",
-        "--test-hf", REAL, "--test-config", "test", "--hf-token", HF_TOKEN,
-        "--out", f"{OUT}/hyp_{m}.jsonl", "--batch-size", "16")
+        "--engine", "faster-whisper", "--mode", "recording", "--language", "none",
+        "--test-hf", REAL, "--test-config", "test",
+        "--ct2-cache", "/kaggle/temp/ct2",
+        "--out", f"{OUT}/hyp_{m}.jsonl")
 """),
 
     md("## Results — reproduce the ordering of Table 2"),
@@ -455,7 +499,7 @@ systems = [
 ]
 rows = []
 for name, f, paper_mer in systems:
-    r = score(f"{OUT}/refs_test.jsonl", f"{OUT}/{f}")
+    r = score(f"{OUT}/refs_recording.jsonl", f"{OUT}/{f}")
     rows.append((name, r, paper_mer))
 
 print(f"{'system':<20}{'MER':>8}{'paper':>8}{'CBA-HE':>9}{'CBA-EH':>9}")

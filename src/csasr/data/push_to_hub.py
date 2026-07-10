@@ -120,17 +120,21 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--config", required=True)
     ap.add_argument("--text-only", action="store_true")
     ap.add_argument("--public", action="store_true")
-    ap.add_argument("--token", default=None)
+    # Never pass a token in argv: it lands in tracebacks and in `ps` output.
+    ap.add_argument("--token", default=None, help="prefer the HF_TOKEN env var")
     ap.add_argument("--verify", action="store_true", help="round-trip check after push")
     args = ap.parse_args(argv)
 
+    import os
+
+    token = args.token or os.environ.get("HF_TOKEN")
     with_audio = not args.text_only
     push_manifest(
         args.manifest, args.repo, args.config,
-        with_audio=with_audio, private=not args.public, token=args.token,
+        with_audio=with_audio, private=not args.public, token=token,
     )
     if args.verify:
-        verify_round_trip(args.manifest, args.repo, args.config, token=args.token, with_audio=with_audio)
+        verify_round_trip(args.manifest, args.repo, args.config, token=token, with_audio=with_audio)
     return 0
 
 

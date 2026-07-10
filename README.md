@@ -60,11 +60,58 @@ Each is cheap relative to what it protects. **Run them in this order.**
 | **0** | `verify_table1.py` reproduces the paper's Table 1 word and bigram counts | CPU, seconds |
 | **1** | Bigram yield ratios track the paper (13.3% dedup, 92.3% filter) | free (end of Stage 1) |
 | **2** | `Train_T1 ⊆ Train_T2`; durations ≈ 8h / 22h; spot-listen | free (end of Stage 2) |
-| **3** | `whisper-large-v2` zero-shot ≈ **52.0 MER / 42.9 CBA-HE** | ~40 min on a T4 |
+| **3** | `whisper-large-v2` zero-shot ≈ **52.0 MER / 42.9 CBA-HE** | ~15 min on a T4 |
 
 Gate 3 is inference-only and validates decoding, normalization, language ID, and
 both metrics against a *published* number. It is not our baseline — it is the
 calibration of the measuring instrument. **Run it before generating anything.**
+
+### Gate 3 caught a real bug, which is the whole point
+
+The first Gate 3 run returned **MER 75.6 / CBA-HE 14.7** against the paper's
+52.0 / 42.9. Since CBA does not depend on the MER definition, a 3× miss there
+meant the *hypotheses* were wrong, not the metric.
+
+Cause: we were decoding the 3,136 isolated 6-second clips, while the paper
+decodes whole recordings with WhisperX. Without surrounding context Whisper
+renders English loanwords in Devanagari, so a hypothesis contains **no script
+boundary and no switch bigram can match**. Per-utterance language detection also
+flipped to Urdu on some clips, and short zero-padded inputs triggered `तो तो तो …`
+repetition loops. Measured on real test audio, same model, same audio span:
+
+| decoding | %Latin in hypothesis | MER | CBA-HE |
+|---|---|---|---|
+| reference | 21.6% | — | — |
+| per-clip (wrong) | **0.0%** | 182.6 | 0.0 |
+| recording-level | 12.2% | 103.1 | 1.6 |
+
+`decode.py` now defaults to `--engine faster-whisper --mode recording`:
+faster-whisper is the engine WhisperX wraps, so we get one language detection per
+recording, 30-second chunks with context, beam 5, VAD, temperature fallback, and
+a compression-ratio threshold that aborts repetition loops. `utt_id` encodes the
+recording, so the `test` config already on the Hub is regrouped in place — no
+re-upload. Scoring is recording-level (`score.py --group recording`, or use the
+refs file `decode.py` emits): MER is a corpus-level ratio, so concatenation is
+equivalent, and CBA correctly *gains* the bigrams that straddle segment joins.
+
+This cost one 40-minute inference run and saved 6–8 hours of TTS plus 5 hours of
+training measured against a broken ruler.
+
+**What is verified, and what is not.** Recording-level decoding demonstrably fixes
+MER (182.6 → 65.6 on whisper-small, same audio), stabilises language detection to
+a single `hi` per recording, and eliminates the repetition loops. Whether it
+restores CBA-HE to the paper's 42.9 has **not** been verified — only a
+`whisper-large-v2` run can settle that, and it must be run on a GPU.
+
+whisper-small is a poor proxy for the script question: it transliterates every
+English word into Devanagari (`impress` → `इंप्रस`), so its CBA is structurally
+zero under *every* decoder setting. An ablation over `vad_filter` ×
+`condition_on_previous_text` moved %Latin only between 0.7% and 2.9%, never CBA.
+large-v2 does emit Latin — it scored CBA-HE 14.7 even under the broken per-clip
+protocol — so its zero-shot CBA should rise substantially once context is
+restored. Expect our own `whisper-small` zero-shot baseline row to have CBA ≈ 0;
+that is the model, not the pipeline, and fine-tuning on mixed-script targets is
+precisely what fixes it.
 
 ### Gate 0 status: PASSED
 
@@ -166,6 +213,12 @@ Hindi word counts to within 4 of the paper's.
 from stock Kaggle images. Pinned to the `3.x` line, which decodes via
 `librosa` + `soundfile`. This would have failed *during training*, not at import.
 
+**5. Never pass an HF token as a command-line argument.** `decode.py`,
+`train_whisper.py`, and `push_to_hub.py` read `HF_TOKEN` from the environment.
+An earlier version took `--hf-token`, and the value was reproduced verbatim in a
+Kaggle traceback (it is also visible in `ps` output). If you ever see a token in
+a log, revoke it at [hf.co/settings/tokens](https://huggingface.co/settings/tokens).
+
 ---
 
 ## Deviations from the paper
@@ -175,9 +228,11 @@ from stock Kaggle images. Pinned to the `3.x` line, which decodes via
 | **D1** | Llama-3.3-70B-Instruct | **Llama-3.1-8B-Instruct**, NF4 | 70B is 141 GB in bf16. Nearest same-family model with official Hindi support. |
 | **D2** | whisper-large-v2 (1.54B) | **whisper-small** (244M) | Fits a T4. *(There is no `whisper-small-v2`; `v2`/`v3` exist only for `large`.)* |
 | **D3** | Full FT, AdamW, lr 2e-5, batch 64 | **unchanged** | A consequence of D2: whisper-small full FT fits, so no LoRA substitution is needed. |
-| **D4** | WhisperX, `language=None` | `transformers.generate(language=None)` | WhisperX needs a CTranslate2 conversion; same decode condition. |
+| **D4** | WhisperX, `language=None` | **faster-whisper** (the engine WhisperX wraps), recording-level, `language=None` | Same decoding algorithm and heuristics, minus WhisperX's forced alignment, which we don't need because we score at recording level. Our fine-tuned checkpoints are converted to CTranslate2 on first use and cached. |
 | **D5** | Common Voice (official) | `fsicoli/common_voice_17_0` | Mozilla moved CV to the Data Collective in Oct 2025; the HF repo is now an empty stub. |
 | **D6** | 4h dev from real train | same, **plus** a synthetic-only dev logged alongside | The paper's dev set is real in-domain audio, a mild leak against its "no real data" claim. |
+| **D7** | 15h Common Voice Hindi | **11.87h** | CV 17 Hindi holds only ~20.6h across `dev`+`test`+`train`+`other`; after the 1–30s duration filter and clips missing from the per-split TSVs, 11.87h is all that exists. English is the full 15.00h. Affects M8 only. |
+| **D8** | Per-utterance MER / CBA | **recording-level** MER / CBA | Forced by D4. MER is a corpus-level ratio, so concatenation is equivalent; CBA correctly gains the bigrams that straddle segment joins. 30 recordings instead of 3,136 clips. |
 
 D1 and D2 both cost quality, so **absolute MER will not match Table 2**. The claim
 under test is the **ordering and relative gains**: `zero-shot > M6 > M7 > M8`.

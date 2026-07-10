@@ -32,6 +32,9 @@ local = ["requests>=2.31", "soxr>=0.3"]
 llm = ["llama-cpp-python>=0.3.0"]
 tts = ["transformers==4.46.1", "parler-tts"]   # parler-tts hard-pins transformers; NEVER install with `train`
 train = ["transformers>=4.49", "accelerate>=1.1", "evaluate>=0.4", "tensorboard"]
+# faster-whisper is the engine WhisperX wraps; ctranslate2 converts our
+# fine-tuned HF checkpoints into the format it loads.
+decode = ["faster-whisper>=1.0", "ctranslate2>=4.0"]
 dev = ["pytest>=8.0", "torch", "transformers>=4.49", "accelerate>=1.1"]
 
 [tool.setuptools.packages.find]
