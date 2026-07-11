@@ -423,16 +423,71 @@ def run(*args):
     print(">", " ".join(str(a) for a in args), flush=True)
     subprocess.run([sys.executable, "-m", *args], check=True)   # inherits HF_TOKEN
 
+import torch
+N_GPU = torch.cuda.device_count()
+print(f"{{N_GPU}} GPU(s) visible")
 !nvidia-smi --query-gpu=name,memory.total --format=csv
 """),
 
-    md("## GATE 3 — calibrate the metric against a published number\n\nInference only. ~15 min on a T4 (30 recordings, not 3,136 clips)."),
+    md("""## Decoding: use **both** T4s and batch the chunks
+
+Sequential decoding pinned one GPU at ~4 GB of 15 GB and left the second idle — large-v2
+took 1h50m. Two independent fixes:
+
+* **Batched inference** (`--batch-size 16`). VAD carves the recording into speech chunks and
+  they are decoded as a batch instead of one at a time: **8× faster**, measured. This is not a
+  shortcut — batched VAD inference is exactly what WhisperX does, so it is *more* faithful to
+  the paper than our sequential loop was.
+* **Shard recordings across the two GPUs**, one process each: another **2×**.
+
+Together: large-v2 ≈ **1h50m → ~8 min**.
+
+`--lang-detect-segments 8` also lands here. faster-whisper detects the language from a *single*
+30-second window by default, and one bad window sends a whole recording into Urdu — where no
+Hindi/English switch bigram can match and CBA collapses. Voting over 8 windows fixes it."""),
     code("""
-run("csasr.eval.decode", "--model", "openai/whisper-large-v2",
-    "--engine", "faster-whisper", "--mode", "recording", "--language", "none",
-    "--test-hf", REAL, "--test-config", "test",
-    "--out", f"{OUT}/hyp_largev2_zeroshot.jsonl",
-    "--refs-out", f"{OUT}/refs_recording.jsonl")
+from pathlib import Path
+from csasr.manifest import read_jsonl, write_jsonl
+from csasr.eval.ct2 import resolve_ct2
+
+CT2 = "/kaggle/temp/ct2"
+
+def decode(model, out_name, batch_size=16):
+    \"\"\"Shard the 30 recordings across every GPU, decode in parallel, merge.\"\"\"
+    # Convert ONCE up front: two processes racing on the same cache dir would
+    # corrupt it. Prebuilt OpenAI models pass straight through.
+    resolve_ct2(model, cache_dir=CT2, quantization="float16")
+
+    n = max(1, N_GPU)
+    procs = []
+    for i in range(n):
+        cmd = [sys.executable, "-m", "csasr.eval.decode",
+               "--model", model, "--engine", "faster-whisper", "--mode", "recording",
+               "--language", "none", "--batch-size", str(batch_size),
+               "--lang-detect-segments", "8",
+               "--test-hf", REAL, "--test-config", "test", "--ct2-cache", CT2,
+               "--shard", str(i), "--num-shards", str(n),
+               "--out", f"{OUT}/{out_name}.shard{i}.jsonl",
+               "--refs-out", f"{OUT}/refs.shard{i}.jsonl"]
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(i))
+        print(f"> GPU{i}: {model} shard {i}/{n}", flush=True)
+        procs.append(subprocess.Popen(cmd, env=env))
+
+    for i, p in enumerate(procs):
+        if p.wait() != 0:
+            raise RuntimeError(f"decode shard {i} failed (exit {p.returncode})")
+
+    hyps = [r for i in range(n) for r in read_jsonl(f"{OUT}/{out_name}.shard{i}.jsonl")]
+    refs = [r for i in range(n) for r in read_jsonl(f"{OUT}/refs.shard{i}.jsonl")]
+    write_jsonl(f"{OUT}/{out_name}.jsonl", hyps)
+    write_jsonl(f"{OUT}/refs_recording.jsonl", sorted(refs, key=lambda r: r["utt_id"]))
+    print(f"merged {len(hyps)} recordings -> {OUT}/{out_name}.jsonl")
+    return hyps
+"""),
+
+    md("## GATE 3 — calibrate the metric against a published number\n\nInference only, ~8 min on 2× T4."),
+    code("""
+decode("openai/whisper-large-v2", "hyp_largev2_zeroshot")
 """),
 
     code("""
@@ -448,44 +503,61 @@ print("\\nIf MER is far from 52 or CBA-HE far from 42.9, STOP. Do not generate d
 print("against a ruler that does not reproduce a published number.")
 """),
 
+    md("### Diagnostics — read these before trusting the numbers above"),
     code("""
-# Sanity: the hypotheses must carry BOTH scripts, or CBA is structurally zero.
+from collections import Counter
 from csasr.manifest import read_jsonl
+from csasr.eval.cba import cba
+from csasr.eval.mer import mer
 from csasr.lid import Lang, count_words
 from csasr.normalize import normalize
+
+refs = {r["utt_id"]: r["text"] for r in read_jsonl(f"{OUT}/refs_recording.jsonl")}
+hyps = list(read_jsonl(f"{OUT}/hyp_largev2_zeroshot.jsonl"))
+R = [refs[h["utt_id"]] for h in hyps]
+H = [h["hyp"] for h in hyps]
 
 def mix(t):
     c = count_words(normalize(t, "scoring")); tot = sum(c.values()) or 1
     return c[Lang.HI] / tot, c[Lang.EN] / tot
 
-refs = {r["utt_id"]: r["text"] for r in read_jsonl(f"{OUT}/refs_recording.jsonl")}
-hyps = list(read_jsonl(f"{OUT}/hyp_largev2_zeroshot.jsonl"))
-rh, re_ = mix(" ".join(refs.values()))
-hh, he = mix(" ".join(h["hyp"] for h in hyps))
+# 1) BOTH scripts must be present, or CBA is structurally zero regardless of MER.
+rh, re_ = mix(" ".join(R)); hh, he = mix(" ".join(H))
 print(f"REFERENCE : {rh:5.1%} Devanagari  {re_:5.1%} Latin")
 print(f"HYPOTHESIS: {hh:5.1%} Devanagari  {he:5.1%} Latin")
-print("detected languages:", {h["detected_language"] for h in hyps})
+
+# 2) Hindi/Urdu confusion destroys switch points wholesale.
+print("\\ndetected language per recording:", dict(Counter(h["detected_language"] for h in hyps)))
+def wc(t): return sum(count_words(normalize(t, "scoring")).values())
+bad = [h for h in hyps if h["detected_language"] != "hi"]
+if bad:
+    share = sum(wc(refs[h["utt_id"]]) for h in bad) / sum(wc(t) for t in R)
+    print(f"  non-hi: {len(bad)}/{len(hyps)} recordings = {share:.1%} of reference words")
+    hi = [h for h in hyps if h["detected_language"] == "hi"]
+    ch = cba([refs[h["utt_id"]] for h in hi], [h["hyp"] for h in hi])
+    ca = cba(R, H)
+    print(f"  CBA-HE  all {ca.he:.1f}  ->  hi-only {ch.he:.1f}")
+    print(f"  CBA-EH  all {ca.eh:.1f}  ->  hi-only {ch.eh:.1f}")
+
+# 3) Is any residual MER gap definitional rather than a quality gap?
+print()
+for p in ("raw", "punct", "scoring"):
+    print(f"MER preset={p:8}: {mer(R, H, preset=p):.1f}")
 """),
 
-    md("## whisper-small zero-shot — the actual baseline for M6/M7/M8"),
+    md("## whisper-small zero-shot — the actual baseline for M6/M7/M8\n\nExpect its CBA ≈ 0: whisper-small transliterates English into Devanagari, so it has no script boundary to match. That is the model, not the pipeline — and it is exactly what fine-tuning is supposed to fix."),
     code("""
-run("csasr.eval.decode", "--model", "openai/whisper-small",
-    "--engine", "faster-whisper", "--mode", "recording", "--language", "none",
-    "--test-hf", REAL, "--test-config", "test",
-    "--out", f"{OUT}/hyp_small_zeroshot.jsonl")
+decode("openai/whisper-small", "hyp_small_zeroshot")
 """),
 
     md("""## Decode the fine-tuned models
 
 `decode.py` converts each HF checkpoint to CTranslate2 on first use and caches it, so
-faster-whisper can load it. Run this **only after** `02_train.ipynb` has pushed the repos."""),
+faster-whisper can load it. Run this **only after** `02_train.ipynb` has pushed the repos —
+otherwise you get a 404, which is expected, not a bug."""),
     code("""
 for m in ("m6", "m7", "m8"):
-    run("csasr.eval.decode", "--model", f"RohanRamesh/whisper-small-cs-{m}",
-        "--engine", "faster-whisper", "--mode", "recording", "--language", "none",
-        "--test-hf", REAL, "--test-config", "test",
-        "--ct2-cache", "/kaggle/temp/ct2",
-        "--out", f"{OUT}/hyp_{m}.jsonl")
+    decode(f"RohanRamesh/whisper-small-cs-{m}", f"hyp_{m}")
 """),
 
     md("## Results — reproduce the ordering of Table 2"),

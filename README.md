@@ -97,6 +97,33 @@ equivalent, and CBA correctly *gains* the bigrams that straddle segment joins.
 This cost one 40-minute inference run and saved 6–8 hours of TTS plus 5 hours of
 training measured against a broken ruler.
 
+### Decoding speed: use the whole machine
+
+The first working Gate 3 run took **1h50m** for large-v2 while pinning one GPU at 4 GB of
+15 GB and leaving Kaggle's second T4 completely idle. Two independent fixes, both in
+`decode.py`:
+
+| lever | effect |
+|---|---|
+| `--batch-size 16` (VAD chunks decoded as a batch, not one at a time) | **8×** — measured, whisper-small: 253s → 32s on 181s of audio |
+| `--num-shards N` + `CUDA_VISIBLE_DEVICES` (one process per GPU) | **2×** on Kaggle's 2× T4 |
+
+Together large-v2 drops to roughly **8 minutes**.
+
+Batching is not a shortcut: **batched VAD inference is precisely what WhisperX does** — it is
+the feature that makes WhisperX "70× realtime". Our original sequential loop was the *less*
+faithful option. It does cost a little accuracy (whisper-small: MER 75.3 → 80.6), and the
+penalty shrinks as the model gets stronger (whisper-tiny, which hallucinates freely, was far
+worse). Every system is decoded identically, so the M6→M7→M8 comparison is unaffected. Pass
+`--batch-size 1` to fall back to sequential.
+
+`--lang-detect-segments 8` ships alongside. faster-whisper detects the language from a
+**single 30-second window** by default; Whisper confuses Hindi with Urdu constantly (same
+spoken language, different script), and one bad window sends an entire recording into
+Perso-Arabic, where no Hindi↔English switch bigram can match and CBA collapses. Voting over
+8 windows fixes it. The first Gate 3 run reported `detected languages: {'ur', 'hi'}`, which
+is the likely cause of its CBA-HE shortfall (29.2 against the paper's 42.9).
+
 **What is verified, and what is not.** Recording-level decoding demonstrably fixes
 MER (182.6 → 65.6 on whisper-small, same audio), stabilises language detection to
 a single `hi` per recording, and eliminates the repetition loops. Whether it
