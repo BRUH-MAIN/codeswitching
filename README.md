@@ -240,7 +240,15 @@ Hindi word counts to within 4 of the paper's.
 from stock Kaggle images. Pinned to the `3.x` line, which decodes via
 `librosa` + `soundfile`. This would have failed *during training*, not at import.
 
-**5. Never pass an HF token as a command-line argument.** `decode.py`,
+**5. `pip install git+...` does NOT pick up new code in a live kernel.** pip sees the
+package version is already satisfied and silently skips the reinstall — so a Kaggle
+session that has run once keeps executing **old code** even after you push. The symptom
+is baffling: `error: unrecognized arguments: --shard`, from a repo that demonstrably
+has `--shard`. The notebooks now `--force-reinstall --no-deps` and assert
+`csasr.__version__`, so a stale kernel fails loudly at cell 1. **Bump the version in
+`pyproject.toml` whenever Kaggle must pick up a change.**
+
+**6. Never pass an HF token as a command-line argument.** `decode.py`,
 `train_whisper.py`, and `push_to_hub.py` read `HF_TOKEN` from the environment.
 An earlier version took `--hf-token`, and the value was reproduced verbatim in a
 Kaggle traceback (it is also visible in `ps` output). If you ever see a token in

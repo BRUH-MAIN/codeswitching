@@ -82,7 +82,11 @@ costs at most the in-flight shard.
     code(f"""
 !pip install -q "transformers==4.46.1" "datasets<4" bitsandbytes accelerate soxr
 !pip install -q git+https://github.com/huggingface/parler-tts.git
-!pip install -q git+{REPO}
+!pip install -q --force-reinstall --no-deps git+{REPO}
+
+import csasr
+assert csasr.__version__ >= "0.2.0", f"stale csasr {{csasr.__version__}}; restart the kernel"
+print("csasr", csasr.__version__)
 
 import transformers
 assert transformers.__version__ == "4.46.1", (
@@ -284,10 +288,21 @@ what we test is the **M6 → M7 → M8 ordering**.
 """),
 
     code(f"""
-!pip install -q git+{REPO}
 # datasets>=4 decodes Audio via torchcodec, which stock Kaggle images lack.
 !pip install -q -U transformers accelerate evaluate jiwer
-!pip install -q "datasets<4" librosa soundfile
+!pip install -q "datasets<4" librosa soundfile soxr omegaconf rich
+
+# csasr LAST and FORCED: `pip install git+...` treats an already-installed
+# version as satisfied and SKIPS the reinstall, so re-running in a live kernel
+# silently keeps OLD code. --no-deps because the deps are installed above.
+!pip install -q --force-reinstall --no-deps git+{REPO}
+
+import csasr
+assert csasr.__version__ >= "0.2.0", (
+    f"stale csasr {{csasr.__version__}} - the kernel is running old code. "
+    "Restart the kernel (Run > Restart & clear) and re-run this cell."
+)
+print("csasr", csasr.__version__)
 
 import os, subprocess, sys
 from pathlib import Path
@@ -403,9 +418,20 @@ regrouped into its 30 recordings here — no re-upload.
 """),
 
     code(f"""
-!pip install -q git+{REPO}
 !pip install -q -U transformers jiwer faster-whisper ctranslate2
-!pip install -q "datasets<4" librosa soundfile   # see 02_train: torchcodec
+!pip install -q "datasets<4" librosa soundfile soxr omegaconf rich
+
+# csasr LAST and FORCED: `pip install git+...` treats an already-installed
+# version as satisfied and skips the reinstall, so a re-run in a live kernel
+# silently keeps OLD code. --no-deps because the deps are installed above.
+!pip install -q --force-reinstall --no-deps git+{REPO}
+
+import csasr
+assert csasr.__version__ >= "0.2.0", (
+    f"stale csasr {{csasr.__version__}} - the kernel is running old code. "
+    "Restart the kernel (Run > Restart & clear) and re-run this cell."
+)
+print("csasr", csasr.__version__)
 
 import os, subprocess, sys
 os.environ["HF_HOME"] = "/kaggle/temp/hf"
