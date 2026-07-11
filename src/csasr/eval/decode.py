@@ -285,12 +285,16 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[decode] wrote {n:,} hypotheses -> {args.out}")
 
     if args.mode == "recording":
-        refs = concat_refs([{"utt_id": r["utt_id"], "text": r["text"]} for r in rows])
-        refs_path = args.refs_out or args.out.with_name("refs_recording.jsonl")
-        write_jsonl(refs_path, [{"utt_id": k, "text": v} for k, v in sorted(refs.items())])
-        print(f"[decode] wrote {len(refs):,} recording-level references -> {refs_path}")
+        # PER-UTTERANCE refs, not concatenated. CBA's denominator is Table 1's
+        # per-utterance bigram count; concatenating first fabricates ~1,000 extra
+        # HE bigrams at segment joins. score.py --group recording concatenates
+        # internally for MER and keeps the utterances for CBA.
+        refs_path = args.refs_out or args.out.with_name("refs_utt.jsonl")
+        write_jsonl(refs_path, [{"utt_id": r["utt_id"], "text": r["text"]} for r in rows])
+        print(f"[decode] wrote {len(rows):,} per-utterance references -> {refs_path}")
         print(f"\n  score on CPU:\n"
-              f"    python -m csasr.eval.score --refs {refs_path} --hyps {args.out}")
+              f"    python -m csasr.eval.score --refs {refs_path} --hyps {args.out} "
+              f"--group recording")
     return 0
 
 

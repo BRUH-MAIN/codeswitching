@@ -124,6 +124,41 @@ Perso-Arabic, where no Hindi↔English switch bigram can match and CBA collapses
 8 windows fixes it. The first Gate 3 run reported `detected languages: {'ur', 'hi'}`, which
 is the likely cause of its CBA-HE shortfall (29.2 against the paper's 42.9).
 
+### GATE 3 result — MER reproduces; CBA is ambiguous in the paper
+
+Run on 2× T4, large-v2 zero-shot, decoded recording-level with faster-whisper:
+
+| metric | ours | paper |
+|---|---|---|
+| MER (word) | 54.8 | — |
+| **MER (hybrid)** | **51.9** | **52.0** |
+| CBA-HE (`adjacent`) | 20.1 | 42.9 |
+| **CBA-HE (`lenient`)** | **43.8** | **42.9** |
+| CBA-EH (`lenient`) | 40.9 | ~36 |
+| HE denominator | 4,125 | 4,189 |
+
+**The MER definition is settled.** `hybrid` — characters on Devanagari, words on Latin,
+the SEAME rule from Zhang et al. — lands on 51.9 against a published 52.0. The `word`
+reading does not. That ambiguity is closed empirically.
+
+**A real bug was found and fixed.** Our CBA denominator was computed from *concatenated*
+recordings, which fabricated ~1,000 HE bigrams straddling segment joins that no reference
+utterance contains — inflating the denominator 23% and halving CBA. The denominator must
+come from the reference *utterances* (Table 1's count). `cba_grouped()` now does this,
+applying the multiset cap once per recording rather than per utterance.
+
+**The CBA matching rule is genuinely unrecoverable from the paper.** "Correctly recognized"
+is never defined. With hypotheses whose MER already matches theirs to 0.2%:
+
+* `adjacent` (both words correct *and* adjacent — the literal reading of "bigram") → 20.1
+* `lenient` (both words recognized somewhere) → 43.8, essentially their 42.9
+* edit-distance alignment → 33.6 / 35.0, but it inverts the HE > EH ordering that holds in
+  every row of their Table 2, so it is unlikely to be theirs
+
+We report **both** and default to `adjacent`. This does not affect the experiment: every
+system is scored identically, and the M6 → M7 → M8 ordering Track 2 actually tests is
+preserved under either rule. Never mix modes across systems.
+
 **What is verified, and what is not.** Recording-level decoding demonstrably fixes
 MER (182.6 → 65.6 on whisper-small, same audio), stabilises language detection to
 a single `hi` per recording, and eliminates the repetition loops. Whether it

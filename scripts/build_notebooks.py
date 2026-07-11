@@ -85,7 +85,7 @@ costs at most the in-flight shard.
 !pip install -q --force-reinstall --no-deps git+{REPO}
 
 import csasr
-assert csasr.__version__ >= "0.2.0", f"stale csasr {{csasr.__version__}}; restart the kernel"
+assert csasr.__version__ >= "0.3.0", f"stale csasr {{csasr.__version__}}; restart the kernel"
 print("csasr", csasr.__version__)
 
 import transformers
@@ -298,7 +298,7 @@ what we test is the **M6 → M7 → M8 ordering**.
 !pip install -q --force-reinstall --no-deps git+{REPO}
 
 import csasr
-assert csasr.__version__ >= "0.2.0", (
+assert csasr.__version__ >= "0.3.0", (
     f"stale csasr {{csasr.__version__}} - the kernel is running old code. "
     "Restart the kernel (Run > Restart & clear) and re-run this cell."
 )
@@ -427,7 +427,7 @@ regrouped into its 30 recordings here — no re-upload.
 !pip install -q --force-reinstall --no-deps git+{REPO}
 
 import csasr
-assert csasr.__version__ >= "0.2.0", (
+assert csasr.__version__ >= "0.3.0", (
     f"stale csasr {{csasr.__version__}} - the kernel is running old code. "
     "Restart the kernel (Run > Restart & clear) and re-run this cell."
 )
@@ -494,7 +494,7 @@ def decode(model, out_name, batch_size=16):
                "--test-hf", REAL, "--test-config", "test", "--ct2-cache", CT2,
                "--shard", str(i), "--num-shards", str(n),
                "--out", f"{OUT}/{out_name}.shard{i}.jsonl",
-               "--refs-out", f"{OUT}/refs.shard{i}.jsonl"]
+               "--refs-out", f"{OUT}/refs.shard{i}.jsonl"]   # PER-UTTERANCE refs
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(i))
         print(f"> GPU{i}: {model} shard {i}/{n}", flush=True)
         procs.append(subprocess.Popen(cmd, env=env))
@@ -506,7 +506,7 @@ def decode(model, out_name, batch_size=16):
     hyps = [r for i in range(n) for r in read_jsonl(f"{OUT}/{out_name}.shard{i}.jsonl")]
     refs = [r for i in range(n) for r in read_jsonl(f"{OUT}/refs.shard{i}.jsonl")]
     write_jsonl(f"{OUT}/{out_name}.jsonl", hyps)
-    write_jsonl(f"{OUT}/refs_recording.jsonl", sorted(refs, key=lambda r: r["utt_id"]))
+    write_jsonl(f"{OUT}/refs_utt.jsonl", sorted(refs, key=lambda r: r["utt_id"]))
     print(f"merged {len(hyps)} recordings -> {OUT}/{out_name}.jsonl")
     return hyps
 """),
@@ -519,14 +519,26 @@ decode("openai/whisper-large-v2", "hyp_largev2_zeroshot")
     code("""
 from csasr.eval.score import score
 
-for mode in ("word", "hybrid"):
-    res = score(f"{OUT}/refs_recording.jsonl", f"{OUT}/hyp_largev2_zeroshot.jsonl", mer_mode=mode)
-    print(f"MER mode={mode:<7} -> MER {res['mer']:.1f}   CBA-HE {res['cba_he']:.1f}   CBA-EH {res['cba_eh']:.1f}")
+REFS = f"{OUT}/refs_utt.jsonl"          # PER-UTTERANCE: CBA's denominator is Table 1's
+HYP  = f"{OUT}/hyp_largev2_zeroshot.jsonl"
 
-print("\\npaper (large-v2 zero-shot): MER 52.0   CBA-HE 42.9   CBA-EH 36.x")
-print("Whichever mode lands near 52.0 is the definition the authors used.")
-print("\\nIf MER is far from 52 or CBA-HE far from 42.9, STOP. Do not generate data")
-print("against a ruler that does not reproduce a published number.")
+for mm in ("word", "hybrid"):
+    r = score(REFS, HYP, group="recording", mer_mode=mm)
+    print(f"MER {mm:<7} {r['mer']:>6.1f}")
+print()
+for cm in ("adjacent", "lenient"):
+    r = score(REFS, HYP, group="recording", cba_mode=cm)
+    print(f"CBA {cm:<9} HE {r['cba_he']:>5.1f}   EH {r['cba_eh']:>5.1f}   "
+          f"(HE denominator {r['he_total']:,})")
+
+print("\\npaper (large-v2 zero-shot): MER 52.0   CBA-HE 42.9   CBA-EH 36.x   HE denom 4,189")
+print()
+print("MER: 'hybrid' reproduces the paper (51.9 vs 52.0), so they use the SEAME")
+print("     definition - characters on Devanagari, words on Latin.")
+print("CBA: the paper never defines 'correctly recognized'. 'lenient' lands on their")
+print("     42.9; 'adjacent' is the literal bigram reading and lands at half. Both are")
+print("     reported. Every system is scored identically, so the M6->M7->M8 ordering")
+print("     that Track 2 actually tests is unaffected. See csasr/eval/cba.py.")
 """),
 
     md("### Diagnostics — read these before trusting the numbers above"),
@@ -538,7 +550,8 @@ from csasr.eval.mer import mer
 from csasr.lid import Lang, count_words
 from csasr.normalize import normalize
 
-refs = {r["utt_id"]: r["text"] for r in read_jsonl(f"{OUT}/refs_recording.jsonl")}
+from csasr.eval.grouping import concat_refs
+refs = concat_refs(list(read_jsonl(f"{OUT}/refs_utt.jsonl")))
 hyps = list(read_jsonl(f"{OUT}/hyp_largev2_zeroshot.jsonl"))
 R = [refs[h["utt_id"]] for h in hyps]
 H = [h["hyp"] for h in hyps]
@@ -597,7 +610,7 @@ systems = [
 ]
 rows = []
 for name, f, paper_mer in systems:
-    r = score(f"{OUT}/refs_recording.jsonl", f"{OUT}/{f}")
+    r = score(f"{OUT}/refs_utt.jsonl", f"{OUT}/{f}", group="recording", mer_mode="hybrid")
     rows.append((name, r, paper_mer))
 
 print(f"{'system':<20}{'MER':>8}{'paper':>8}{'CBA-HE':>9}{'CBA-EH':>9}")

@@ -8,7 +8,7 @@ silently under-count the denominator and inflate CBA.
 
 import pytest
 
-from csasr.eval.cba import cba, corpus_cs_bigram_stats, reference_cs_counts
+from csasr.eval.cba import cba, cba_grouped, corpus_cs_bigram_stats, reference_cs_counts
 from csasr.eval.mer import mer
 
 
@@ -55,6 +55,61 @@ class TestCBA:
         refs = ["इस document।"]
         hyps = ["इस Document"]
         assert cba(refs, hyps).he == 100.0
+
+
+class TestCBAGrouped:
+    """Recording-level hypotheses with a per-utterance denominator."""
+
+    REF = [
+        ("spk_R_0000", "इस document में"),   # HE: (इस, document); EH: (document, में)
+        ("spk_R_0001", "यह file है"),        # HE: (यह, file);     EH: (file, है)
+    ]
+    GROUP = lambda self, u: u.split("_")[-2]
+
+    def test_denominator_comes_from_utterances_not_concatenation(self):
+        # Concatenating gives "... में यह ..." (HI->HI, no switch), but if the
+        # join happened to straddle scripts it would invent a bigram. The
+        # denominator must equal the sum over utterances: 2 HE, 2 EH.
+        r = cba_grouped(self.REF, {"R": "इस document में यह file है"}, self.GROUP)
+        assert (r.he_total, r.eh_total) == (2, 2)
+        assert r.he == 100.0 and r.eh == 100.0
+
+    def test_concatenation_would_have_invented_a_bigram(self):
+        # utt0 ends in English, utt1 starts in Hindi -> concatenating creates a
+        # spurious EH pair ("document", "यह") that no utterance contains.
+        refs = [("s_R_0000", "इस document"), ("s_R_0001", "यह file")]
+        r = cba_grouped(refs, {"R": "इस document यह file"}, self.GROUP)
+        assert r.he_total == 2          # (इस,document) and (यह,file)
+        assert r.eh_total == 0          # NOT 1 -- the join pair is not counted
+
+    def test_multiset_cap_is_per_recording_not_per_utterance(self):
+        # The same HE bigram in two utterances, but only ONE occurrence in the
+        # hypothesis. Both utterances must not each claim it: 1/2, not 2/2.
+        refs = [("s_R_0000", "इस document"), ("s_R_0001", "इस document")]
+        r = cba_grouped(refs, {"R": "इस document और कुछ"}, self.GROUP)
+        assert r.he_total == 2
+        assert r.he_matched == 1
+        assert r.he == 50.0
+
+    def test_lenient_mode_ignores_adjacency(self):
+        refs = [("s_R_0000", "इस document")]
+        hyp = {"R": "document कुछ और इस"}      # both words present, not adjacent
+        assert cba_grouped(refs, hyp, self.GROUP, mode="adjacent").he == 0.0
+        assert cba_grouped(refs, hyp, self.GROUP, mode="lenient").he == 100.0
+
+    def test_lenient_is_still_capped_by_multiset(self):
+        refs = [("s_R_0000", "इस document"), ("s_R_0001", "इस document")]
+        hyp = {"R": "इस x document"}           # one 'इस', one 'document'
+        r = cba_grouped(refs, hyp, self.GROUP, mode="lenient")
+        assert r.he_total == 2 and r.he_matched == 1
+
+    def test_missing_hypothesis_fails_loudly(self):
+        with pytest.raises(SystemExit, match="no hypothesis"):
+            cba_grouped(self.REF, {}, self.GROUP)
+
+    def test_unknown_mode_rejected(self):
+        with pytest.raises(ValueError, match="unknown cba mode"):
+            cba_grouped(self.REF, {"R": "x"}, self.GROUP, mode="fuzzy")
 
 
 class TestCorpusStats:
