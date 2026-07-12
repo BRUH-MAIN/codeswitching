@@ -113,6 +113,53 @@ class LLMBackend(abc.ABC):
         return [o or "" for o in out]
 
 
+def _oom_message(model_id: str, original: str) -> str:
+    """Diagnose 'Some modules are dispatched on the CPU or the disk'.
+
+    bitsandbytes refuses to offload a quantized model, so accelerate raises this
+    the moment the weights do not fit in FREE GPU memory. On Kaggle the cause is
+    almost always a notebook kernel that already holds a model: Jupyter's `Out[]`
+    history keeps references alive, so `del model` + `empty_cache()` frees
+    nothing, and the subprocess inherits a half-full GPU.
+    """
+    lines = [
+        f"{model_id} does not fit in FREE GPU memory.",
+        "",
+        f"  bitsandbytes error: {original[:110]}",
+        "",
+    ]
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            lines.append("  GPU memory right now:")
+            for i in range(torch.cuda.device_count()):
+                free, total = torch.cuda.mem_get_info(i)
+                used = (total - free) / 2**30
+                lines.append(
+                    f"    cuda:{i}  {free / 2**30:5.1f} GiB free / {total / 2**30:.1f} GiB"
+                    f"   ({used:.1f} GiB already in use)"
+                )
+            lines.append("")
+    except Exception:  # noqa: BLE001 - diagnostics must never mask the real error
+        pass
+
+    lines += [
+        "  Most likely: the NOTEBOOK KERNEL is still holding a model. `del model` does",
+        "  not free VRAM in Jupyter -- the Out[] history keeps references alive. Fix:",
+        "",
+        "    1. Restart the kernel (Run > Restart & clear all).",
+        "    2. Make sure you are on the CURRENT notebook: the smoke test must run as a",
+        "       subprocess (`run(\"csasr.llm.smoke\", ...)`), NOT load the model in-kernel.",
+        "       Re-download notebooks/01a_generate_text.ipynb if yours differs -- `pip",
+        "       install` updates the package but NOT the notebook.",
+        "",
+        "  If the GPU really is empty and it still does not fit, use a smaller model:",
+        "    --model google/gemma-4-E2B-it",
+    ]
+    return "\n".join(lines)
+
+
 def _merge_system_into_user(messages: list[dict]) -> list[dict]:
     """Fold a system turn into the first user turn.
 
@@ -238,7 +285,13 @@ class TransformersBackend(LLMBackend):
             try:
                 model = getattr(transformers, name).from_pretrained(self.model_id, **kw)
             except (ValueError, KeyError, OSError, TypeError) as e:
-                errors.append(f"{name}: {type(e).__name__}: {str(e)[:90]}")
+                msg = str(e)
+                # This one is NOT an auto-class problem -- it is "the GPU is full".
+                # Every candidate will fail identically, so bail out now with a
+                # diagnosis instead of three misleading tracebacks.
+                if "dispatched on the CPU" in msg or "disk" in msg.lower():
+                    raise SystemExit(_oom_message(self.model_id, msg)) from e
+                errors.append(f"{name}: {type(e).__name__}: {msg[:90]}")
                 continue
             if name != "AutoModelForCausalLM":
                 print(f"[llm] {self.model_id}: loaded via {name} (text-only inputs)")

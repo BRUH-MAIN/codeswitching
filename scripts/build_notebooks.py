@@ -95,10 +95,17 @@ Runtime ≈ 2h. Every LLM call is cached, so a 12h timeout costs nothing on a re
 !pip install -q "datasets<4" librosa soundfile soxr omegaconf rich
 !pip install -q --force-reinstall --no-deps git+{REPO}
 
+# This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
+# .ipynb -- an old notebook against a new package is a real and confusing failure
+# (the old 01a loaded the model in-kernel and starved every subprocess of VRAM).
+NOTEBOOK_VERSION = "0.7.1"
+
 import csasr, transformers
-assert csasr.__version__ >= "0.7.0", (
-    f"stale csasr {{csasr.__version__}} - the kernel is running old code. "
-    "Restart the kernel (Run > Restart & clear) and re-run this cell."
+assert csasr.__version__ == NOTEBOOK_VERSION, (
+    f"csasr package is {{csasr.__version__}} but this NOTEBOOK is {{NOTEBOOK_VERSION}}.\\n"
+    "  package older  -> restart the kernel (Run > Restart & clear); pip skips a\\n"
+    "                    reinstall when the version looks satisfied.\\n"
+    "  notebook older -> re-download it from the repo; pip does NOT update .ipynb files."
 )
 from packaging.version import Version
 assert Version(transformers.__version__) >= Version("5.5"), (
@@ -137,7 +144,16 @@ def run(*args):
             f"this traceback - scroll up in this cell's output."
         )
 
-!nvidia-smi --query-gpu=name,memory.total --format=csv
+import torch
+for i in range(torch.cuda.device_count()):
+    free, total = torch.cuda.mem_get_info(i)
+    print(f"cuda:{i}  {free/2**30:5.1f} GiB free / {total/2**30:.1f} GiB")
+    assert free / total > 0.85, (
+        f"cuda:{i} already has {(total-free)/2**30:.1f} GiB in use. Something in THIS "
+        "kernel is holding the GPU (an older notebook loaded the model in-cell). "
+        "Every subprocess below will then fail with 'Some modules are dispatched on "
+        "the CPU or the disk'. Restart the kernel: Run > Restart & clear all."
+    )
 """),
 
     md("## 1 · Pull the in-domain transcripts (few-shot exemplars)\n\nTrack 2 never trains on real code-switched audio — we only need the *text* of the MUCS train split."),
@@ -265,9 +281,16 @@ costs at most the in-flight shard.
 !pip install -q git+https://github.com/huggingface/parler-tts.git
 !pip install -q --force-reinstall --no-deps git+{REPO}
 
+# This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
+# .ipynb -- an old notebook against a new package is a real and confusing failure.
+NOTEBOOK_VERSION = "0.7.1"
+
 import csasr, transformers
-assert csasr.__version__ >= "0.7.0", (
-    f"stale csasr {{csasr.__version__}} - restart the kernel (Run > Restart & clear)."
+assert csasr.__version__ == NOTEBOOK_VERSION, (
+    f"csasr package is {{csasr.__version__}} but this NOTEBOOK is {{NOTEBOOK_VERSION}}.\\n"
+    "  package older  -> restart the kernel (Run > Restart & clear); pip skips a\\n"
+    "                    reinstall when the version looks satisfied.\\n"
+    "  notebook older -> re-download it from the repo; pip does NOT update .ipynb files."
 )
 assert transformers.__version__ == "4.46.1", (
     f"transformers is {{transformers.__version__}}, expected 4.46.1 - something imported "
@@ -425,10 +448,16 @@ what we test is the **M6 → M7 → M8 ordering**.
 # silently keeps OLD code. --no-deps because the deps are installed above.
 !pip install -q --force-reinstall --no-deps git+{REPO}
 
+# This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
+# .ipynb -- an old notebook against a new package is a real and confusing failure.
+NOTEBOOK_VERSION = "0.7.1"
+
 import csasr
-assert csasr.__version__ >= "0.7.0", (
-    f"stale csasr {{csasr.__version__}} - the kernel is running old code. "
-    "Restart the kernel (Run > Restart & clear) and re-run this cell."
+assert csasr.__version__ == NOTEBOOK_VERSION, (
+    f"csasr package is {{csasr.__version__}} but this NOTEBOOK is {{NOTEBOOK_VERSION}}. "
+    "If the PACKAGE is older: restart the kernel (Run > Restart & clear) -- pip skips "
+    "a reinstall when the version already looks satisfied. If the NOTEBOOK is older: "
+    "re-download it from the repo -- pip does NOT update .ipynb files."
 )
 print("csasr", csasr.__version__)
 
@@ -554,10 +583,16 @@ regrouped into its 30 recordings here — no re-upload.
 # silently keeps OLD code. --no-deps because the deps are installed above.
 !pip install -q --force-reinstall --no-deps git+{REPO}
 
+# This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
+# .ipynb -- an old notebook against a new package is a real and confusing failure.
+NOTEBOOK_VERSION = "0.7.1"
+
 import csasr
-assert csasr.__version__ >= "0.7.0", (
-    f"stale csasr {{csasr.__version__}} - the kernel is running old code. "
-    "Restart the kernel (Run > Restart & clear) and re-run this cell."
+assert csasr.__version__ == NOTEBOOK_VERSION, (
+    f"csasr package is {{csasr.__version__}} but this NOTEBOOK is {{NOTEBOOK_VERSION}}. "
+    "If the PACKAGE is older: restart the kernel (Run > Restart & clear) -- pip skips "
+    "a reinstall when the version already looks satisfied. If the NOTEBOOK is older: "
+    "re-download it from the repo -- pip does NOT update .ipynb files."
 )
 print("csasr", csasr.__version__)
 
