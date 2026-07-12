@@ -46,87 +46,131 @@ def notebook(cells: list[dict]) -> dict:
 
 
 # ===========================================================================
-# 01 - generate dataset (LLM text + TTS audio + push to Hub)
+# 01a - generate the code-mixed TEXT (Gemma 3, modern transformers)
 # ===========================================================================
+#
+# SPLIT FROM 01b ON PURPOSE. parler-tts hard-pins transformers==4.46.1; Gemma 3
+# needs transformers>=4.50. They cannot share a process. The Hub is the
+# checkpoint between the two notebooks.
 
-NB01 = notebook([
+NB01A = notebook([
     md(f"""
-# Track 2 · Stage 1+2 — Generate the synthetic code-mixed corpus
+# Track 2 · Stage 1 — Generate the code-mixed **text**
 
 Replication of Biswas et al., Interspeech 2025 (Track 2).
 
-This notebook does **all** data generation and pushes the result to the Hub:
+Few-shot-prompt **Gemma 4 E4B** for Hindi-English bigrams → filter them → expand each
+into four sentences (~16k). Push the text to `RohanRamesh/hi-en-synth-cs`.
 
-1. **Stage 1** — few-shot prompt Llama-3.1-8B for Hindi-English bigrams, filter them,
-   expand each into four sentences (~16k sentences).
-2. **Stage 2** — synthesize them with Indic Parler-TTS (Rohit / Divya), 22h of audio.
-3. Push `synth_t2` + `t1_ids.json` to `RohanRamesh/hi-en-synth-cs`.
+Audio synthesis is a **separate notebook** (`01b`). `parler-tts` hard-pins
+`transformers==4.46.1`, Gemma 4 needs `transformers>=5.5` — they cannot coexist in one
+process. The Hub is the checkpoint between them.
 
-### Why one notebook can host both models
-`parler-tts` hard-pins `transformers==4.46.1`. vLLM will not tolerate that pin, but
-`transformers` 4.46.1 *does* support Llama-3.1, so the LLM runs under bitsandbytes NF4
-in the same environment. (vLLM is also out on principle: its AWQ kernels need compute
-capability ≥ 8.0 and the T4 is sm75.)
+### The model: `google/gemma-4-E4B-it`
+* **apache-2.0, ungated** — no licence click-through, no gated-repo token scope, no mirror
+  needed. (Gemma 3's `google/*` repos *are* gated; Gemma 4's are not.)
+* Deviation **D1**: the paper used Llama-3.3-70B (141 GB bf16). Gemma 4 E4B is ~8B raw
+  params, pretrained on 140+ languages, and a **deterministic script filter** sits behind it
+  to catch what it still gets wrong.
+* The one **live risk**: Gemma 4 is **bf16-native** (`torch_dtype: bfloat16`) and the T4 is
+  Turing — it has **no bf16**. fp16 activations can exceed 65,504 and go non-finite.
+  `backend.py` probes the logits after loading and transparently reloads with float32 compute
+  if they are NaN/inf. **The smoke test below is how you find out**, in about a minute.
+* Two non-issues, confirmed against the real config (the backend defends against both anyway):
+  it is `Gemma4ForConditionalGeneration` but *is* registered under `AutoModelForCausalLM`, and
+  its chat template **does** support a `system` role — so the paper's verbatim system prompt
+  survives intact.
 
 ### Before you run
-* Accept the licence for `ai4bharat/indic-parler-tts` (gated) and `meta-llama/Llama-3.1-8B-Instruct`.
-* Add your HF **write** token to Kaggle Secrets as `HF_TOKEN`.
-* Turn notebook internet **on**, accelerator **GPU T4 x2**.
-* `STAGE` below lets you resume: `text`, `audio`, or `both`.
+* HF **write** token in Kaggle Secrets as `HF_TOKEN`. Internet **on**, **GPU T4 ×2**.
+* Nothing to accept — Gemma 4 is apache-2.0. (Parler-TTS *is* gated; that bites in `01b`.)
 
-Runtime ≈ 2h (LLM) + 4–6h (TTS). Everything is cached/sharded, so a 12h timeout
-costs at most the in-flight shard.
+Runtime ≈ 2h. Every LLM call is cached, so a 12h timeout costs nothing on a re-run.
 """),
 
-    md("## 0 · Install\n\n**Cell order matters.** The `transformers` downgrade silently no-ops if anything has already imported `transformers`. Do not import it above this cell."),
+    md("## 0 · Install"),
     code(f"""
-!pip install -q "transformers==4.46.1" "datasets<4" bitsandbytes accelerate soxr
-!pip install -q git+https://github.com/huggingface/parler-tts.git
+# Gemma 4 needs transformers >= 5.5. NO parler-tts here -- that is 01b's problem.
+!pip install -q -U "transformers>=5.5" accelerate bitsandbytes
+!pip install -q "datasets<4" librosa soundfile soxr omegaconf rich
 !pip install -q --force-reinstall --no-deps git+{REPO}
 
-import csasr
-assert csasr.__version__ >= "0.3.0", f"stale csasr {{csasr.__version__}}; restart the kernel"
-print("csasr", csasr.__version__)
-
-import transformers
-assert transformers.__version__ == "4.46.1", (
-    f"transformers is {{transformers.__version__}}, expected 4.46.1 - "
-    "something imported it before the downgrade took effect. Restart the kernel."
+import csasr, transformers
+assert csasr.__version__ >= "0.6.0", (
+    f"stale csasr {{csasr.__version__}} - the kernel is running old code. "
+    "Restart the kernel (Run > Restart & clear) and re-run this cell."
 )
-print("transformers", transformers.__version__)
+from packaging.version import Version
+assert Version(transformers.__version__) >= Version("5.5"), (
+    f"transformers {{transformers.__version__}} cannot load Gemma 4 (needs >= 5.5)."
+)
+print("csasr", csasr.__version__, "| transformers", transformers.__version__)
 """),
 
     code("""
-import os, gc, json, subprocess, sys
+import os, subprocess, sys
 from pathlib import Path
 
-# Keep 8.7 GB of model weights out of the 20 GB /kaggle/working budget.
 os.environ["HF_HOME"] = "/kaggle/temp/hf"
 Path(os.environ["HF_HOME"]).mkdir(parents=True, exist_ok=True)
 
 from kaggle_secrets import UserSecretsClient
-HF_TOKEN = UserSecretsClient().get_secret("HF_TOKEN")
-os.environ["HF_TOKEN"] = HF_TOKEN
-
+os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
 from huggingface_hub import login
-login(token=HF_TOKEN)
+login(token=os.environ["HF_TOKEN"])
+HF_TOKEN = os.environ["HF_TOKEN"]
 
-STAGE      = "both"          # "text" | "audio" | "both"
 REAL_REPO  = "RohanRamesh/mucs-he-cs"
 SYNTH_REPO = "RohanRamesh/hi-en-synth-cs"
-LLM        = "meta-llama/Llama-3.1-8B-Instruct"   # or unsloth/Meta-Llama-3.1-8B-Instruct (ungated)
-NUM_SHARDS = 4
+LLM        = "google/gemma-4-E4B-it"      # apache-2.0, ungated. E2B is the smaller option.
 
-WORK = Path("/kaggle/working")
-MAN  = WORK / "manifests"; MAN.mkdir(parents=True, exist_ok=True)
+WORK  = Path("/kaggle/working")
+MAN   = WORK / "manifests"; MAN.mkdir(parents=True, exist_ok=True)
 CACHE = WORK / "llm_cache"; CACHE.mkdir(parents=True, exist_ok=True)
-AUDIO = WORK / "audio";    AUDIO.mkdir(parents=True, exist_ok=True)
 
 def run(*args):
     print(">", " ".join(str(a) for a in args), flush=True)
-    subprocess.run([sys.executable, "-m", *args], check=True)   # inherits HF_TOKEN
+    p = subprocess.run([sys.executable, "-m", *args])   # inherits HF_TOKEN + streams
+    if p.returncode != 0:
+        raise RuntimeError(
+            f"{args[0]} failed (exit {p.returncode}). The real error is printed ABOVE "
+            f"this traceback - scroll up in this cell's output."
+        )
 
 !nvidia-smi --query-gpu=name,memory.total --format=csv
+"""),
+
+    md("## 0b · SMOKE TEST — 10 bigrams before committing 2 hours\n\nLoads Gemma, runs the fp16 health check, and prints real output. If the bigrams are garbage or empty, **stop here** — do not spend two hours finding out."),
+    code("""
+from csasr.llm.backend import TransformersBackend, Sampling
+from csasr.llm.prompts import bigram_messages
+from csasr.llm.gen_bigrams import parse_bigrams
+from csasr.llm.filter_bigrams import script_filter
+
+EXAMPLES = [
+    "इस spoken tutorial में आपका स्वागत है",
+    "यह बुनियादी formatting के बारे में है",
+    "अब हम एक नया document बनाएंगे",
+    "menu bar पर click करें",
+    "फिर आप file को save कर सकते हैं",
+]
+
+be = TransformersBackend(LLM)   # runs the fp16 -> float32 logits healthcheck
+out = be.chat([bigram_messages(EXAMPLES, n=10)], Sampling(temperature=0.9, max_new_tokens=200))
+bigrams = parse_bigrams(out[0])
+
+print("\\nraw completion:\\n", out[0][:400])
+print("\\nparsed bigrams and whether the script filter accepts them:")
+ok = 0
+for b in bigrams:
+    good = script_filter(b)
+    ok += good is not None
+    print(f"   {'PASS' if good else 'drop'}  {b}")
+print(f"\\n{ok}/{len(bigrams)} survive the Devanagari+Latin filter "
+      f"(the paper's raw->valid survival is ~12%, so even 3-5/10 here is healthy)")
+assert bigrams, "Gemma produced NOTHING parseable - stop and investigate"
+del be
+import gc, torch; gc.collect(); torch.cuda.empty_cache()
 """),
 
     md("## 1 · Pull the in-domain transcripts (few-shot exemplars)\n\nTrack 2 never trains on real code-switched audio — we only need the *text* of the MUCS train split."),
@@ -140,37 +184,34 @@ print(f"{len(train_text):,} in-domain sentences for few-shot prompting")
 print(train_text[0]["text"])
 """),
 
-    md("## 2 · Stage 1a — generate bigrams\n\nPaper: 44,657 raw → 5,932 unique (13.3%)."),
+    md("## 2 · Generate bigrams\n\nPaper: 44,657 raw → 5,932 unique (13.3%)."),
     code("""
-if STAGE in ("text", "both"):
-    run("csasr.llm.gen_bigrams",
-        "--train-manifest", MAN / "mucs_train.jsonl",
-        "--out", MAN / "bigrams_raw.jsonl",
-        "--cache", CACHE / "bigrams.jsonl",
-        "--model", LLM, "--n-calls", "4466", "--batch-size", "16")
+run("csasr.llm.gen_bigrams",
+    "--train-manifest", MAN / "mucs_train.jsonl",
+    "--out", MAN / "bigrams_raw.jsonl",
+    "--cache", CACHE / "bigrams.jsonl",
+    "--model", LLM, "--n-calls", "4466", "--batch-size", "16")
 """),
 
-    md("## 3 · Stage 1b — filter\n\nDeterministic script filter, then an LLM translation check with 3-sample self-consistency.\nPaper: 5,932 unique → 5,477 valid (92.3%)."),
+    md("## 3 · Filter\n\nDeterministic script filter (one Devanagari token + one Latin token), then an LLM translation check with 3-sample self-consistency.\nPaper: 5,932 unique → 5,477 valid (92.3%)."),
     code("""
-if STAGE in ("text", "both"):
-    run("csasr.llm.filter_bigrams",
-        "--raw", MAN / "bigrams_raw.jsonl",
-        "--out", MAN / "bigrams_valid.jsonl",
-        "--cache", CACHE / "transcheck.jsonl",
-        "--model", LLM, "--items-per-call", "20", "--n-samples", "3")
+run("csasr.llm.filter_bigrams",
+    "--raw", MAN / "bigrams_raw.jsonl",
+    "--out", MAN / "bigrams_valid.jsonl",
+    "--cache", CACHE / "transcheck.jsonl",
+    "--model", LLM, "--items-per-call", "20", "--n-samples", "3")
 """),
 
-    md("## 4 · Stage 2a — expand bigrams into sentences\n\nFour per bigram (2 English-matrix, 2 Hindi-matrix). Paper: ~16,000 unique from a theoretical 21,908."),
+    md("## 4 · Expand each bigram into four sentences\n\n2 English-matrix, 2 Hindi-matrix. Paper: ~16,000 unique from a theoretical 21,908."),
     code("""
-if STAGE in ("text", "both"):
-    run("csasr.llm.gen_sentences",
-        "--bigrams", MAN / "bigrams_valid.jsonl",
-        "--out", MAN / "sentences.jsonl",
-        "--cache", CACHE / "sentences.jsonl",
-        "--model", LLM, "--batch-size", "16")
+run("csasr.llm.gen_sentences",
+    "--bigrams", MAN / "bigrams_valid.jsonl",
+    "--out", MAN / "sentences.jsonl",
+    "--cache", CACHE / "sentences.jsonl",
+    "--model", LLM, "--batch-size", "16")
 """),
 
-    md("### GATE 1 — yield ratios must track the paper\n\nA large divergence in the 13.3% dedup rate means the prompt or temperature is off. Decide here, not later."),
+    md("### GATE 1 — yields must track the paper\n\nA large divergence in the 13.3% dedup rate means the prompt or temperature is off. Decide here, not after 6 hours of TTS."),
     code("""
 from csasr.manifest import read_jsonl
 
@@ -185,45 +226,147 @@ rows = [
     ("valid bigrams",  len(valid),  5_477, len(valid) / max(len(uniq), 1)),
     ("sentences",      len(sents), 16_000, None),
 ]
-print(f"{'metric':<16}{'ours':>10}{'paper':>10}{'survival':>12}   paper survival")
+print(f"{'metric':<16}{'ours':>10}{'paper':>10}{'survival':>12}")
 for name, got, want, surv in rows:
     s = f"{surv:.1%}" if surv else "-"
     print(f"{name:<16}{got:>10,}{want:>10,}{s:>12}")
 print("\\npaper survival: dedup 13.3%, filter 92.3%")
+print("\\nGemma 3 4B is far smaller than the paper's 70B (deviation D1), so a lower")
+print("valid-bigram yield is expected. What matters is that ENOUGH sentences survive:")
+print(f"  -> {len(sents):,} sentences  (need >~8,000 for a usable 22h corpus)")
 
-# Free the LLM before Parler-TTS claims the GPU.
-import torch
-gc.collect(); torch.cuda.empty_cache()
+for r in sents[:5]:
+    print("   ", r["text"])
 """),
 
-    md("## 5 · Push the text artifacts immediately\n\nCheckpointing to the Hub *before* the long TTS run means a session timeout never costs the LLM stage."),
+    md("## 5 · Push the text to the Hub\n\nThis is the handoff to `01b`. Push before anything can time out."),
     code("""
-if STAGE in ("text", "both"):
-    for man, cfg in [("bigrams_valid.jsonl", "bigrams"), ("sentences.jsonl", "sentences")]:
-        run("csasr.data.push_to_hub", "--manifest", MAN / man,
-            "--repo", SYNTH_REPO, "--config", cfg, "--text-only")
+for man, cfg in [("bigrams_valid.jsonl", "bigrams"), ("sentences.jsonl", "sentences")]:
+    run("csasr.data.push_to_hub", "--manifest", MAN / man,
+        "--repo", SYNTH_REPO, "--config", cfg, "--text-only")
+print("\\ntext stage complete -> now run 01b_synthesize_audio.ipynb")
+"""),
+])
+
+
+# ===========================================================================
+# 01b - synthesize the AUDIO (Indic Parler-TTS, transformers==4.46.1)
+# ===========================================================================
+
+NB01B = notebook([
+    md(f"""
+# Track 2 · Stage 2 — Synthesize the code-mixed **audio**
+
+Pulls the ~16k sentences that `01a` pushed, voices them with **Indic Parler-TTS**
+(Rohit ♂ / Divya ♀, 50/50), and pushes ~22h of 16 kHz audio to
+`RohanRamesh/hi-en-synth-cs`.
+
+**Separate notebook because `parler-tts` hard-pins `transformers==4.46.1`**, which cannot
+load the Gemma 3 used in `01a`. No LLM is loaded here.
+
+### Before you run
+* **Accept the licence for [`ai4bharat/indic-parler-tts`](https://huggingface.co/ai4bharat/indic-parler-tts)** — it is gated and has no
+  ungated mirror. If your HF token is *fine-grained*, also tick **"Read access to contents
+  of all public gated repos you can access"**; accepting the licence alone is not enough.
+* HF **write** token in Kaggle Secrets as `HF_TOKEN`. Internet **on**, **GPU T4 ×2**.
+
+Runtime ≈ 4–6h. Sharded — re-running skips every clip already on disk, so a 12h timeout
+costs at most the in-flight shard.
 """),
 
-    md("## 6 · Stage 2b — synthesize audio\n\nIndic Parler-TTS, Rohit (male) / Divya (female) 50/50. Emits 22.05 kHz → resampled to 16 kHz, written as int16 (float32 would be 7 GB).\n\nSharded: rerun this cell after a timeout and it skips whatever already exists."),
-    code("""
-if STAGE in ("audio", "both"):
-    # Pull sentences back from the Hub if this is a fresh session.
-    if not (MAN / "sentences.jsonl").exists():
-        ds = load_dataset(SYNTH_REPO, "sentences", split="train", token=HF_TOKEN)
-        write_jsonl(MAN / "sentences.jsonl", [dict(r) for r in ds])
+    md("## 0 · Install\n\n**Cell order matters.** The `transformers` downgrade silently no-ops if anything has already imported `transformers`. Do not import it above this cell."),
+    code(f"""
+!pip install -q "transformers==4.46.1" "datasets<4" accelerate soxr librosa soundfile
+!pip install -q git+https://github.com/huggingface/parler-tts.git
+!pip install -q --force-reinstall --no-deps git+{REPO}
 
-    for shard in range(NUM_SHARDS):
-        run("csasr.tts.synthesize",
-            "--sentences", MAN / "sentences.jsonl",
-            "--audio-dir", AUDIO,
-            "--out", MAN / f"train_t2.shard{shard}.jsonl",
-            "--shard", str(shard), "--num-shards", str(NUM_SHARDS),
-            "--batch-size", "8")
+import csasr, transformers
+assert csasr.__version__ >= "0.6.0", (
+    f"stale csasr {{csasr.__version__}} - restart the kernel (Run > Restart & clear)."
+)
+assert transformers.__version__ == "4.46.1", (
+    f"transformers is {{transformers.__version__}}, expected 4.46.1 - something imported "
+    "it before the downgrade took effect. Restart the kernel."
+)
+print("csasr", csasr.__version__, "| transformers", transformers.__version__)
 """),
 
-    md("## 7 · Merge shards, build Train_T1 by reference\n\n### GATE 2 — `Train_T1 ⊆ Train_T2`, durations ≈ 8h / 22h"),
     code("""
-import itertools
+import os, subprocess, sys, itertools
+from pathlib import Path
+
+os.environ["HF_HOME"] = "/kaggle/temp/hf"
+Path(os.environ["HF_HOME"]).mkdir(parents=True, exist_ok=True)
+
+from kaggle_secrets import UserSecretsClient
+os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
+from huggingface_hub import login
+login(token=os.environ["HF_TOKEN"])
+HF_TOKEN = os.environ["HF_TOKEN"]
+
+SYNTH_REPO = "RohanRamesh/hi-en-synth-cs"
+TTS        = "ai4bharat/indic-parler-tts"
+NUM_SHARDS = 4
+
+WORK  = Path("/kaggle/working")
+MAN   = WORK / "manifests"; MAN.mkdir(parents=True, exist_ok=True)
+AUDIO = WORK / "audio";     AUDIO.mkdir(parents=True, exist_ok=True)
+
+def run(*args):
+    print(">", " ".join(str(a) for a in args), flush=True)
+    p = subprocess.run([sys.executable, "-m", *args])
+    if p.returncode != 0:
+        raise RuntimeError(
+            f"{args[0]} failed (exit {p.returncode}). The real error is printed ABOVE "
+            f"this traceback - scroll up in this cell's output."
+        )
+
+!nvidia-smi --query-gpu=name,memory.total --format=csv
+"""),
+
+    md("## 0b · PREFLIGHT — Parler-TTS is gated\n\nFails in seconds rather than after a 6-hour run has started."),
+    code("""
+from huggingface_hub import model_info
+from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
+
+try:
+    model_info(TTS, token=HF_TOKEN)
+    print(f"  OK  {TTS}")
+except GatedRepoError:
+    raise SystemExit(
+        f"PREFLIGHT FAILED: {TTS} is gated.\\n"
+        f"  1. Accept the licence at https://huggingface.co/{TTS}\\n"
+        f"  2. If your HF token is FINE-GRAINED, also tick 'Read access to contents of\\n"
+        f"     all public gated repos you can access', then update the Kaggle Secret."
+    )
+except RepositoryNotFoundError:
+    raise SystemExit(f"PREFLIGHT FAILED: {TTS} not found, or your token cannot see it.")
+"""),
+
+    md("## 1 · Pull the sentences generated by `01a`"),
+    code("""
+from datasets import load_dataset
+from csasr.manifest import read_jsonl, write_jsonl
+
+ds = load_dataset(SYNTH_REPO, "sentences", split="train", token=HF_TOKEN)
+write_jsonl(MAN / "sentences.jsonl", [dict(r) for r in ds])
+print(f"{len(ds):,} sentences to synthesize")
+print(ds[0]["text"])
+"""),
+
+    md("## 2 · Synthesize\n\nIndic Parler-TTS emits 22.05 kHz → resampled to 16 kHz and written as **int16** (float32 would be 7 GB rather than 2.5 GB).\n\nSharded: re-run this cell after a timeout and it skips whatever already exists on disk."),
+    code("""
+for shard in range(NUM_SHARDS):
+    run("csasr.tts.synthesize",
+        "--sentences", MAN / "sentences.jsonl",
+        "--audio-dir", AUDIO,
+        "--out", MAN / f"train_t2.shard{shard}.jsonl",
+        "--shard", str(shard), "--num-shards", str(NUM_SHARDS),
+        "--batch-size", "8")
+"""),
+
+    md("## 3 · Merge shards, build Train_T1 by reference\n\n### GATE 2 — `Train_T1 ⊆ Train_T2`, durations ≈ 8h / 22h"),
+    code("""
 merged = list(itertools.chain.from_iterable(
     read_jsonl(MAN / f"train_t2.shard{i}.jsonl") for i in range(NUM_SHARDS)
 ))
@@ -235,8 +378,8 @@ run("csasr.tts.make_subset", "--t2", MAN / "train_t2.jsonl",
     "--out", WORK / "t1_ids.json", "--hours", "8.0")
 """),
 
+    md("### Listen to it. Two clips per voice — do not skip this."),
     code("""
-# Spot-listen 2 clips per voice before committing 5 GPU-hours of training to them.
 import IPython.display as ipd, random
 from csasr.tts.speakers import assign_speaker
 random.seed(0)
@@ -247,7 +390,7 @@ for voice in ("Rohit", "Divya"):
         ipd.display(ipd.Audio(r["wav"]))
 """),
 
-    md("## 8 · Push the synthetic corpus\n\nParquet + FLAC ≈ 1.4 GB (vs 2.5 GB as WAV). The round-trip check catches a corrupted upload *before* a 3h training run."),
+    md("## 4 · Push the synthetic corpus\n\nParquet + FLAC ≈ 1.4 GB (vs 2.5 GB as WAV). The round-trip check catches a corrupted upload *before* a 3h training run."),
     code("""
 run("csasr.data.push_to_hub", "--manifest", MAN / "train_t2.jsonl",
     "--repo", SYNTH_REPO, "--config", "synth_t2", "--verify")
@@ -256,7 +399,7 @@ from huggingface_hub import HfApi
 HfApi().upload_file(path_or_fileobj=str(WORK / "t1_ids.json"),
                     path_in_repo="t1_ids.json", repo_id=SYNTH_REPO,
                     repo_type="dataset", token=HF_TOKEN)
-print("done ->", SYNTH_REPO)
+print("done ->", SYNTH_REPO, "\\nnext: 02_train.ipynb")
 """),
 ])
 
@@ -298,7 +441,7 @@ what we test is the **M6 → M7 → M8 ordering**.
 !pip install -q --force-reinstall --no-deps git+{REPO}
 
 import csasr
-assert csasr.__version__ >= "0.3.0", (
+assert csasr.__version__ >= "0.6.0", (
     f"stale csasr {{csasr.__version__}} - the kernel is running old code. "
     "Restart the kernel (Run > Restart & clear) and re-run this cell."
 )
@@ -427,7 +570,7 @@ regrouped into its 30 recordings here — no re-upload.
 !pip install -q --force-reinstall --no-deps git+{REPO}
 
 import csasr
-assert csasr.__version__ >= "0.3.0", (
+assert csasr.__version__ >= "0.6.0", (
     f"stale csasr {{csasr.__version__}} - the kernel is running old code. "
     "Restart the kernel (Run > Restart & clear) and re-run this cell."
 )
@@ -446,8 +589,15 @@ REAL = "RohanRamesh/mucs-he-cs"
 OUT  = "/kaggle/working"
 
 def run(*args):
+    \"\"\"Run a csasr CLI. On failure, re-raise with the LAST LINES of the child's
+    output -- otherwise Jupyter shows only `exit status 1` and buries the cause.\"\"\"
     print(">", " ".join(str(a) for a in args), flush=True)
-    subprocess.run([sys.executable, "-m", *args], check=True)   # inherits HF_TOKEN
+    p = subprocess.run([sys.executable, "-m", *args])   # inherits HF_TOKEN + streams
+    if p.returncode != 0:
+        raise RuntimeError(
+            f"{{args[0]}} failed (exit {{p.returncode}}). The real error is printed "
+            f"ABOVE this traceback - scroll up in this cell's output."
+        )
 
 import torch
 N_GPU = torch.cuda.device_count()
@@ -630,7 +780,8 @@ with open(f"{OUT}/table2.json", "w") as fh:
 def main() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
     for name, nb in [
-        ("01_generate_dataset.ipynb", NB01),
+        ("01a_generate_text.ipynb", NB01A),      # Gemma 3, transformers >= 4.50
+        ("01b_synthesize_audio.ipynb", NB01B),   # parler-tts, transformers == 4.46.1
         ("02_train.ipynb", NB02),
         ("03_eval.ipynb", NB03),
     ]:

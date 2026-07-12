@@ -52,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--cache", type=Path, default=Path("data/llm_cache/bigrams.jsonl"))
     ap.add_argument("--backend", default="transformers")
-    ap.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
+    ap.add_argument("--model", default="google/gemma-4-E4B-it")
     ap.add_argument("--n-calls", type=int, default=4466, help="~44,657 / 10 per call")
     ap.add_argument("--bigrams-per-call", type=int, default=10)
     ap.add_argument("--sentences-per-prompt", type=int, default=5)

@@ -79,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", type=Path, required=True, help="sentences.jsonl")
     ap.add_argument("--cache", type=Path, default=Path("data/llm_cache/sentences.jsonl"))
     ap.add_argument("--backend", default="transformers")
-    ap.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
+    ap.add_argument("--model", default="google/gemma-4-E4B-it")
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--max-new-tokens", type=int, default=256)

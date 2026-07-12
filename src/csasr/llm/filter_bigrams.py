@@ -73,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", type=Path, required=True, help="bigrams_valid.jsonl")
     ap.add_argument("--cache", type=Path, default=Path("data/llm_cache/transcheck.jsonl"))
     ap.add_argument("--backend", default="transformers")
-    ap.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
+    ap.add_argument("--model", default="google/gemma-4-E4B-it")
     ap.add_argument("--items-per-call", type=int, default=20)
     ap.add_argument("--n-samples", type=int, default=3, help="self-consistency votes")
     ap.add_argument("--batch-size", type=int, default=8)

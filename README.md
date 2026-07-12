@@ -27,10 +27,14 @@ OpenSLR 104  ─┐
 Common Voice ─┘   (text-only train,                                  (train_text,
  (streamed)        4h dev, 5.2h test)                                 dev, test,
                                                                       cv_hi, cv_en)
-                                          01_generate_dataset.ipynb        │
-                                          ├─ gen_bigrams   (Llama-3.1-8B)  │
+                                          01a_generate_text.ipynb          │
+                                          │  transformers>=4.50 + Gemma-3-4B│
+                                          ├─ gen_bigrams                    │
                                           ├─ filter_bigrams                │
-                                          ├─ gen_sentences ─► GATE 1       │
+                                          └─ gen_sentences ─► GATE 1 ──────┼─► hi-en-synth-cs
+                                                                           │   (bigrams,
+                                          01b_synthesize_audio.ipynb       │    sentences)
+                                          │  transformers==4.46.1 + parler │
                                           ├─ synthesize    (Indic Parler)  │
                                           └─ make_subset   ─► GATE 2 ──► hi-en-synth-cs
                                                                        (synth_t2,
@@ -275,7 +279,23 @@ Hindi word counts to within 4 of the paper's.
 from stock Kaggle images. Pinned to the `3.x` line, which decodes via
 `librosa` + `soundfile`. This would have failed *during training*, not at import.
 
-**5. `pip install git+...` does NOT pick up new code in a live kernel.** pip sees the
+**5. Gemma 4 cannot share a process with Parler-TTS, and the T4 has no bf16.**
+
+* `parler-tts` hard-pins `transformers==4.46.1`; **Gemma 4 needs `>=5.5`** (its config says
+  `transformers_version: 5.5.0.dev0`). Irreconcilable — hence `01a_generate_text` (Gemma 4)
+  and `01b_synthesize_audio` (Parler-TTS) are **separate notebooks**, with the Hub as the
+  checkpoint between them.
+* **The live risk:** Gemma 4's config declares `torch_dtype: bfloat16`, and the T4 is Turing
+  — it has **no bf16**. fp16 activations can exceed 65,504 and go non-finite.
+  [`backend.py`](src/csasr/llm/backend.py) probes the logits after loading and transparently
+  reloads with float32 compute if they are NaN/inf. `01a`'s smoke-test cell surfaces this in
+  about a minute, before you spend two hours.
+* Two things I *expected* to be problems and verified are not: Gemma 4 is
+  `Gemma4ForConditionalGeneration` but **is** registered under `AutoModelForCausalLM`, and its
+  chat template **does** support a `system` role — so the paper's verbatim system prompt
+  survives intact. (Gemma 2/3 fail both; the backend defends against them anyway.)
+
+**6. `pip install git+...` does NOT pick up new code in a live kernel.** pip sees the
 package version is already satisfied and silently skips the reinstall — so a Kaggle
 session that has run once keeps executing **old code** even after you push. The symptom
 is baffling: `error: unrecognized arguments: --shard`, from a repo that demonstrably
@@ -295,7 +315,7 @@ a log, revoke it at [hf.co/settings/tokens](https://huggingface.co/settings/toke
 
 | # | Paper | Here | Why |
 |---|---|---|---|
-| **D1** | Llama-3.3-70B-Instruct | **Llama-3.1-8B-Instruct**, NF4 | 70B is 141 GB in bf16. Nearest same-family model with official Hindi support. |
+| **D1** | Llama-3.3-70B-Instruct | **Gemma-4-E4B-it** (`google/gemma-4-E4B-it`, apache-2.0, ungated), NF4 | 70B is 141 GB in bf16. Gemma 4 E4B is ~8B raw params, pretrained on 140+ languages, and a *deterministic* script filter sits behind it. Far smaller than the paper's model — expect a lower valid-bigram yield (Gate 1). |
 | **D2** | whisper-large-v2 (1.54B) | **whisper-small** (244M) | Fits a T4. *(There is no `whisper-small-v2`; `v2`/`v3` exist only for `large`.)* |
 | **D3** | Full FT, AdamW, lr 2e-5, batch 64 | **unchanged** | A consequence of D2: whisper-small full FT fits, so no LoRA substitution is needed. |
 | **D4** | WhisperX, `language=None` | **faster-whisper** (the engine WhisperX wraps), recording-level, `language=None` | Same decoding algorithm and heuristics, minus WhisperX's forced alignment, which we don't need because we score at recording level. Our fine-tuned checkpoints are converted to CTranslate2 on first use and cached. |
@@ -365,9 +385,16 @@ python -m csasr.data.push_to_hub --manifest manifests/mucs_train.jsonl \
 
 ### Stages 1-4 (Kaggle)
 
-Upload [`notebooks/`](notebooks/). Requirements: GPU **T4 x2**, internet **on**, and
-an HF **write** token in Kaggle Secrets as `HF_TOKEN`. Accept the licences for
-`ai4bharat/indic-parler-tts` and `meta-llama/Llama-3.1-8B-Instruct` first.
+Upload [`notebooks/`](notebooks/) and run them in order: **01a → 01b → 02 → 03**.
+Requirements: GPU **T4 x2**, internet **on**, and an HF **write** token in Kaggle Secrets
+as `HF_TOKEN`.
+
+Only one licence to accept: [`ai4bharat/indic-parler-tts`](https://huggingface.co/ai4bharat/indic-parler-tts) (gated, no mirror). The LLM
+uses an **ungated** Gemma 3 mirror. If your token is *fine-grained*, it also needs
+**"Read access to contents of all public gated repos you can access"**.
+
+`01a` and `01b` are separate because `parler-tts` pins `transformers==4.46.1` while
+Gemma 3 needs `>=4.50` — see gotcha 5.
 
 Regenerate the notebooks with `python scripts/build_notebooks.py` — they are thin
 wrappers that `pip install` this package and call into `csasr`, so all logic stays
@@ -401,7 +428,7 @@ src/csasr/
 scripts/
   verify_table1.py  GATE 0
   build_notebooks.py
-notebooks/          01_generate_dataset, 02_train, 03_eval  (Kaggle)
+notebooks/          01a_generate_text, 01b_synthesize_audio, 02_train, 03_eval
 configs/            data, llm, tts, train_m{6,7,8}
 ```
 

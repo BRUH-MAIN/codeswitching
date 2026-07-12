@@ -1,18 +1,39 @@
 # Stage 1: LLM few-shot generation.
 #
 # DEVIATION D1 from the paper, which used Llama-3.3-70B-Instruct (141 GB bf16).
-# Llama-3.1-8B-Instruct is the nearest same-family model with official Hindi
-# support and fits a 16 GB T4 under bitsandbytes NF4.
 #
-# Why not vLLM: its AWQ kernels require compute capability >= 8.0. The T4 is
+# We use Gemma 4 E4B instead: ~8B raw parameters, apache-2.0, UNGATED (no licence
+# click-through, no gated-repo token scope -- unlike Gemma 3, whose google/* repos
+# are gated). Pretrained on 140+ languages, so Devanagari is well covered. A
+# deterministic script filter (filter_bigrams.py) sits behind it to catch what it
+# still gets wrong.
+#
+# Why NOT vLLM: its AWQ kernels need compute capability >= 8.0. Kaggle's T4 is
 # sm75 and raises "quantization method awq is not supported for the current GPU".
+#
+# THREE DEFENCES in backend.py, verified against the real config:
+#   1. Gemma 4 is `Gemma4ForConditionalGeneration` (text + vision + audio). It is
+#      ALSO registered under AutoModelForCausalLM, so that binds -- but Gemma 3
+#      4B+ is image-text and does not. backend.py walks the auto-classes.
+#   2. Gemma 4's chat template DOES support a `system` role, so the paper's
+#      verbatim system prompt survives intact. (Gemma 2's rejects it; backend.py
+#      folds it into the first user turn in that case.)
+#   3. LIVE RISK: Gemma 4's config declares `torch_dtype: bfloat16` and the T4 has
+#      NO bf16. fp16 activations can exceed 65,504 and go non-finite. backend.py
+#      probes the logits after loading and reloads with float32 compute if so.
+#
+# Gemma 4 requires transformers >= 5.5 (its config says 5.5.0.dev0), which is
+# irreconcilable with parler-tts's transformers==4.46.1 pin. Hence the text and
+# audio stages are SEPARATE notebooks (01a / 01b), with the Hub between them.
 
 backend: transformers
-model: meta-llama/Llama-3.1-8B-Instruct
-# Ungated mirror if you would rather not accept Meta's license:
-#   model: unsloth/Meta-Llama-3.1-8B-Instruct
+model: google/gemma-4-E4B-it       # ungated, apache-2.0. ~8B raw / "E4B" effective.
+# Alternatives:
+#   google/gemma-4-E2B-it          smaller; try if E4B OOMs, but weaker Devanagari
+#   unsloth/gemma-3-4b-it          needs only transformers>=4.50
+#   Qwen/Qwen2.5-7B-Instruct       fp16-safe (not bf16-native), no T4 dtype risk
 load_in_4bit: true
-dtype: float16        # T4 is Turing: no bf16
+dtype: float16        # T4 is Turing: no bf16. Auto-falls back to float32 on overflow.
 
 bigrams:
   n_calls: 4466              # 4466 x 10 ~= the paper's 44,657 raw bigrams
