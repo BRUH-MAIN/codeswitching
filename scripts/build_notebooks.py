@@ -98,7 +98,7 @@ Runtime ≈ 2h. Every LLM call is cached, so a 12h timeout costs nothing on a re
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure
 # (the old 01a loaded the model in-kernel and starved every subprocess of VRAM).
-NOTEBOOK_VERSION = "0.7.1"
+NOTEBOOK_VERSION = "0.8.0"
 
 import csasr, transformers
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -232,10 +232,32 @@ for name, got, want, surv in rows:
     s = f"{surv:.1%}" if surv else "-"
     print(f"{name:<16}{got:>10,}{want:>10,}{s:>12}")
 print("\\npaper survival: dedup 13.3%, filter 92.3%")
-print("\\nGemma 3 4B is far smaller than the paper's 70B (deviation D1), so a lower")
+print("\\nGemma 4 E4B is far smaller than the paper's 70B (deviation D1), so a lower")
 print("valid-bigram yield is expected. What matters is that ENOUGH sentences survive:")
 print(f"  -> {len(sents):,} sentences  (need >~8,000 for a usable 22h corpus)")
 
+for r in sents[:5]:
+    print("   ", r["text"])
+"""),
+
+    md("""### Repair — strip the matrix-language labels
+
+Gemma prefixes each sentence with its matrix language:
+
+    English: Many software programs have different aliases निर्धारित for commands.
+
+Left in, Parler-TTS would literally **speak** "English colon, many software programs…" and
+Whisper would then be **trained to emit `English:`** at the start of every transcript. This
+re-cleans the text, re-checks that the bigram survived, and recomputes the matrix language
+(the prefix biased it). Seconds — no LLM re-run."""),
+    code("""
+run("csasr.llm.fix_sentences",
+    "--in", MAN / "sentences.jsonl",
+    "--bigrams", MAN / "bigrams_valid.jsonl",
+    "--out", MAN / "sentences.jsonl")
+
+sents = list(read_jsonl(MAN / "sentences.jsonl"))
+print(f"\\n{len(sents):,} sentences ready for TTS:")
 for r in sents[:5]:
     print("   ", r["text"])
 """),
@@ -283,7 +305,7 @@ costs at most the in-flight shard.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.7.1"
+NOTEBOOK_VERSION = "0.8.0"
 
 import csasr, transformers
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -450,7 +472,7 @@ what we test is the **M6 → M7 → M8 ordering**.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.7.1"
+NOTEBOOK_VERSION = "0.8.0"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -585,7 +607,7 @@ regrouped into its 30 recordings here — no re-upload.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.7.1"
+NOTEBOOK_VERSION = "0.8.0"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (

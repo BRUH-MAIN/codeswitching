@@ -4,4 +4,4 @@ Adapting Whisper for low-resource Hindi-English code-mix speech with
 LLM-synthesised data.
 """
 
-__version__ = "0.7.1"
+__version__ = "0.8.0"

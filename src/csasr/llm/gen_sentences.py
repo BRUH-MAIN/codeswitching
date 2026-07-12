@@ -28,17 +28,46 @@ from .backend import Sampling, build_backend
 from .cache import ResponseCache
 from .prompts import sentence_messages
 
-__all__ = ["parse_sentences", "validate", "matrix_lang", "main"]
+__all__ = ["parse_sentences", "clean_sentence", "validate", "matrix_lang", "main"]
 
-_LEAD = re.compile(r"^\s*(?:\d+[.)]|[-*•])\s*")
+# List markers: "1. ", "2) ", "- ", "* ".
+_LEAD = re.compile(r"^\s*(?:\d+\s*[.)]|[-*•])\s*")
+
+# The matrix-language label the model insists on prefixing. THIS MUST BE STRIPPED:
+# it ends up in the TTS prompt (Parler would literally say "English colon ...")
+# and in the training transcript (Whisper would learn to emit "English:").
+# Observed verbatim from Gemma 4:
+#     English: Many software programs have different aliases निर्धारित for commands.
+#     Hindi: कई सॉफ्टवेयर प्रोग्रामों में ...
+_LANG_LABEL = re.compile(
+    r"^\s*\**\s*(?:english|hindi|hinglish|अंग्रे?ज़ी|हिंदी|हिन्दी)\s*\**\s*[:：\-–—]\s*",
+    re.IGNORECASE,
+)
+
+# Markdown emphasis the model sometimes wraps a whole sentence in.
+_WRAP = re.compile(r"^\s*[*_\"'`]+|[*_\"'`]+\s*$")
+
+
+def clean_sentence(line: str) -> str:
+    """Strip list markers, matrix-language labels, and stray markdown."""
+    prev = None
+    s = line.strip()
+    # Loop: "1. English: ..." needs both stripped, in either order.
+    while s != prev:
+        prev = s
+        s = _LEAD.sub("", s)
+        s = _LANG_LABEL.sub("", s)
+        s = _WRAP.sub("", s)
+        s = s.strip()
+    return " ".join(s.split())
 
 
 def parse_sentences(text: str) -> list[str]:
     out = []
     for line in text.splitlines():
-        line = _LEAD.sub("", line.strip())
+        line = clean_sentence(line)
         if len(line.split()) >= 3:
-            out.append(" ".join(line.split()))
+            out.append(line)
     return out
 
 

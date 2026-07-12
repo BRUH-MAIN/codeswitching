@@ -4,7 +4,7 @@ from csasr.llm.backend import EchoBackend, Sampling
 from csasr.llm.cache import ResponseCache
 from csasr.llm.filter_bigrams import parse_verdicts, script_filter
 from csasr.llm.gen_bigrams import parse_bigrams
-from csasr.llm.gen_sentences import matrix_lang, parse_sentences, validate
+from csasr.llm.gen_sentences import clean_sentence, matrix_lang, parse_sentences, validate
 from csasr.llm.prompts import bigram_messages, sentence_messages, translation_check_messages
 
 
@@ -78,10 +78,57 @@ class TestParseVerdicts:
         assert parse_verdicts("9: YES\nblah\n1: NO", n=2) == {0: False}
 
 
+class TestSentenceCleaning:
+    """Gemma 4 prefixes each sentence with its matrix language.
+
+    Left in, those labels get SPOKEN by Parler-TTS ("English colon, many
+    software programs...") and then LEARNED by Whisper. They must not survive
+    into sentences.jsonl.
+    """
+
+    REAL = [  # verbatim from the Kaggle Gate 1 run
+        ("English: Many software programs have different aliases निर्धारित for commands.",
+         "Many software programs have different aliases निर्धारित for commands."),
+        ("Hindi: कई सॉफ्टवेयर प्रोग्रामों में कमांड के लिए अलग-अलग aliases निर्धारित होते हैं।",
+         "कई सॉफ्टवेयर प्रोग्रामों में कमांड के लिए अलग-अलग aliases निर्धारित होते हैं।"),
+        ("The artist painted a beautiful scene on the canvas पर.",
+         "The artist painted a beautiful scene on the canvas पर."),   # unchanged
+    ]
+
+    @pytest.mark.parametrize("raw,want", REAL)
+    def test_strips_the_matrix_language_label(self, raw, want):
+        assert clean_sentence(raw) == want
+
+    @pytest.mark.parametrize("raw", [
+        "1. English: open the file फिर",
+        "2) Hindi: यह file है ok",
+        "**English:** click the button यहाँ",
+        "हिंदी: यह एक test है",
+        "Hinglish - मैं office जा रहा हूँ",
+    ])
+    def test_catches_every_label_shape(self, raw):
+        got = clean_sentence(raw)
+        assert not got.lower().startswith(("english", "hindi", "hinglish"))
+        assert not got.startswith(("1.", "2)", "*", "हिंदी:"))
+
+    @pytest.mark.parametrize("raw", [
+        "English is a language जो सीखना है",
+        "हिंदी भाषा का course बहुत अच्छा है",
+    ])
+    def test_does_not_eat_a_legitimate_leading_word(self, raw):
+        # Only a "Label:" prefix is a label. A sentence that merely STARTS with
+        # the word "English" must survive untouched.
+        assert clean_sentence(raw) == raw
+
+
 class TestSentences:
     def test_parse_strips_markers(self):
         out = parse_sentences("1. इस document को open करो\n2. Please इस file को देखें")
         assert out == ["इस document को open करो", "Please इस file को देखें"]
+
+    def test_parse_strips_language_labels(self):
+        out = parse_sentences("English: open the file फिर\nHindi: यह file है ok")
+        assert out == ["open the file फिर", "यह file है ok"]
 
     def test_validate_requires_adjacent_bigram(self):
         assert validate("मैंने इस document को खोला", "इस", "document")
