@@ -26,7 +26,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from ..lid import Lang, tokenize, word_lang
+from ..lid import cs_bigrams, tokenize
 from ..manifest import read_jsonl, write_jsonl
 from .backend import Sampling, build_backend
 from .cache import ResponseCache
@@ -37,21 +37,36 @@ __all__ = ["script_filter", "parse_verdicts", "main"]
 _VERDICT = re.compile(r"^\s*(\d+)\s*[:.)-]\s*(YES|NO)\b", re.IGNORECASE)
 
 
-def script_filter(bigram: str) -> tuple[str, str] | None:
-    """Return (hindi_word, english_word) if valid, else None.
+def script_filter(phrase: str, *, strict: bool = False) -> tuple[str, str, str] | None:
+    """Extract the first Hindi<->English script-crossing pair from `phrase`.
 
-    Valid means: exactly two whitespace-separated tokens, one purely Devanagari
-    and one purely Latin, in either order.
+    Returns (bigram_text, hindi_word, english_word) preserving the pair's
+    original word order, or None if the phrase crosses no script boundary.
+
+    WHY THIS EXTRACTS RATHER THAN VALIDATES  (deviation D9)
+    -------------------------------------------------------
+    The paper's Llama-3.3-70B obeyed "each bigram is a couple of different
+    words". A far smaller model does not -- Gemma 4 reliably appends a THIRD:
+
+        बुनियादी formatting basics   ->  (बुनियादी, formatting)   the bigram is right there
+        नया document create          ->  (नया, document)
+        click पर action              ->  (click, पर)              EH switch
+        menu bar click               ->  None                     all English, correctly dropped
+
+    Demanding exactly two tokens threw away 10/10 of a real Gemma-4 sample even
+    though 7 of them carried a perfectly good switch point. So we pull the first
+    script-crossing adjacent pair out of whatever comes back. The PROMPT stays
+    verbatim from the paper; only our parser is more forgiving.
+
+    `strict=True` restores the paper-faithful two-token-only behaviour.
     """
-    toks = tokenize(bigram)
-    if len(toks) != 2:
+    if strict and len(tokenize(phrase)) != 2:
         return None
-    langs = [word_lang(t) for t in toks]
-    if set(langs) != {Lang.HI, Lang.EN}:
-        return None
-    hi = toks[0] if langs[0] is Lang.HI else toks[1]
-    en = toks[1] if langs[0] is Lang.HI else toks[0]
-    return hi, en
+    for bg in cs_bigrams(phrase):
+        if bg.kind == "HE":                       # hi then en
+            return f"{bg.first} {bg.second}", bg.first, bg.second
+        return f"{bg.first} {bg.second}", bg.second, bg.first   # EH: en then hi
+    return None
 
 
 def parse_verdicts(text: str, n: int) -> dict[int, bool]:
@@ -80,19 +95,38 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--skip-translation-check", action="store_true")
+    ap.add_argument("--strict-bigrams", action="store_true",
+                    help="paper-faithful: require exactly two tokens, do not extract "
+                         "the switch pair from a longer phrase")
     args = ap.parse_args(argv)
 
     raw = [r["bigram"] for r in read_jsonl(args.raw)]
     unique = sorted(set(raw))
     print(f"[filter] raw={len(raw):,}  unique={len(unique):,}  ({len(unique)/max(len(raw),1):.1%})")
 
+    # Extract the switch-point pair from each phrase. Gemma emits trigrams
+    # ("बुनियादी formatting basics"), so the bigram we keep is the EXTRACTED pair,
+    # not the raw line. Dedup again afterwards: several phrases can yield the
+    # same pair.
+    seen: set[str] = set()
     pairs: list[tuple[str, str, str]] = []  # (bigram, hi, en)
-    for bg in unique:
-        got = script_filter(bg)
-        if got:
-            pairs.append((bg, *got))
-    print(f"[filter] script filter: {len(pairs):,} / {len(unique):,} "
-          f"({len(pairs)/max(len(unique),1):.1%}) have one Devanagari + one Latin token")
+    for phrase in unique:
+        got = script_filter(phrase, strict=args.strict_bigrams)
+        if not got:
+            continue
+        bigram, hi, en = got
+        if bigram in seen:
+            continue
+        seen.add(bigram)
+        pairs.append((bigram, hi, en))
+
+    n_extracted = sum(1 for b, _, _ in pairs if b not in unique)
+    print(f"[filter] script filter: {len(pairs):,} distinct switch-point pairs "
+          f"from {len(unique):,} unique phrases "
+          f"({len(pairs)/max(len(unique),1):.1%})")
+    if n_extracted:
+        print(f"[filter]   of which {n_extracted:,} were EXTRACTED from longer phrases "
+              f"(the model ignored 'a couple of words'; see script_filter docstring)")
 
     is_translation: dict[str, bool] = {bg: False for bg, _, _ in pairs}
 

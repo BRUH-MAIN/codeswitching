@@ -250,6 +250,9 @@ hf_token*
 /results/
 /runs/
 /wandb/
+# NOTE: /temp/ is deliberately TRACKED (commit 35e8290). It holds the decoded
+# hypotheses pulled back from Kaggle, which make the Gate 3 / CBA analysis
+# reproducible on CPU without a GPU. ~2 MB. Do not add it here.
 checkpoint-*/
 *.ckpt
 *.pt

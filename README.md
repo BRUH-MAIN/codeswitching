@@ -322,7 +322,8 @@ a log, revoke it at [hf.co/settings/tokens](https://huggingface.co/settings/toke
 | **D5** | Common Voice (official) | `fsicoli/common_voice_17_0` | Mozilla moved CV to the Data Collective in Oct 2025; the HF repo is now an empty stub. |
 | **D6** | 4h dev from real train | same, **plus** a synthetic-only dev logged alongside | The paper's dev set is real in-domain audio, a mild leak against its "no real data" claim. |
 | **D7** | 15h Common Voice Hindi | **11.87h** | CV 17 Hindi holds only ~20.6h across `dev`+`test`+`train`+`other`; after the 1–30s duration filter and clips missing from the per-split TSVs, 11.87h is all that exists. English is the full 15.00h. Affects M8 only. |
-| **D8** | Per-utterance MER / CBA | **recording-level** MER / CBA | Forced by D4. MER is a corpus-level ratio, so concatenation is equivalent; CBA correctly gains the bigrams that straddle segment joins. 30 recordings instead of 3,136 clips. |
+| **D8** | Per-utterance MER / CBA | **recording-level** MER / CBA | Forced by D4. MER is a corpus-level ratio, so concatenation is equivalent. CBA's denominator still comes from the reference *utterances* (Table 1's count). |
+| **D9** | LLM obeys "a couple of words" | **We extract the switch pair from longer phrases** | The paper's 70B emitted true bigrams. Gemma 4 reliably appends a third word (`बुनियादी formatting basics`). Demanding exactly two tokens threw away **10/10** of a real Gemma-4 sample even though **8** carried a valid switch point. The *prompt* stays verbatim; only `script_filter` is more forgiving. `--strict-bigrams` restores the paper-faithful behaviour. |
 
 D1 and D2 both cost quality, so **absolute MER will not match Table 2**. The claim
 under test is the **ordering and relative gains**: `zero-shot > M6 > M7 > M8`.

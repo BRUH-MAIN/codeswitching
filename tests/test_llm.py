@@ -30,18 +30,43 @@ class TestParseBigrams:
 
 class TestScriptFilter:
     def test_accepts_hindi_then_english(self):
-        assert script_filter("प्रतीत document") == ("प्रतीत", "document")
+        assert script_filter("प्रतीत document") == ("प्रतीत document", "प्रतीत", "document")
 
-    def test_accepts_english_then_hindi_and_normalizes_order(self):
-        assert script_filter("document प्रतीत") == ("प्रतीत", "document")
+    def test_english_then_hindi_keeps_word_order_but_labels_correctly(self):
+        # bigram text preserves the EH order; hi/en are labelled by script.
+        assert script_filter("document प्रतीत") == ("document प्रतीत", "प्रतीत", "document")
 
     def test_rejects_monolingual(self):
         assert script_filter("open document") is None
         assert script_filter("यह दस्तावेज़") is None
 
-    def test_rejects_wrong_token_count(self):
+    def test_rejects_single_token(self):
         assert script_filter("प्रतीत") is None
-        assert script_filter("प्रतीत document file") is None
+
+    def test_extracts_the_switch_pair_from_a_longer_phrase(self):
+        # Gemma 4 emits trigrams; the bigram is inside. Deviation D9.
+        assert script_filter("बुनियादी formatting basics")[0] == "बुनियादी formatting"
+        assert script_filter("नया document create")[0] == "नया document"
+        assert script_filter("click पर action")[0] == "click पर"
+
+    def test_extraction_drops_a_monolingual_phrase(self):
+        assert script_filter("menu bar click") is None
+        assert script_filter("file save document") is None
+
+    def test_strict_mode_is_paper_faithful(self):
+        # The paper's 70B obeyed "a couple of words"; strict reproduces that.
+        assert script_filter("बुनियादी formatting basics", strict=True) is None
+        assert script_filter("बुनियादी formatting", strict=True) is not None
+
+    def test_real_gemma4_sample_yields_8_of_10(self):
+        """Verbatim output from the Kaggle smoke test. Strict kept 0/10."""
+        sample = [
+            "बुनियादी formatting basics", "नया document create", "menu bar click",
+            "file save document", "प्रस्तुति presentation skill", "यह tutorial guide",
+            "आपका स्वागत welcome", "अब हम new", "click पर action", "करना do task",
+        ]
+        assert sum(script_filter(p) is not None for p in sample) == 8
+        assert sum(script_filter(p, strict=True) is not None for p in sample) == 0
 
 
 class TestParseVerdicts:

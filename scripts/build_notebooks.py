@@ -46,11 +46,11 @@ def notebook(cells: list[dict]) -> dict:
 
 
 # ===========================================================================
-# 01a - generate the code-mixed TEXT (Gemma 3, modern transformers)
+# 01a - generate the code-mixed TEXT (Gemma 4, transformers >= 5.5)
 # ===========================================================================
 #
-# SPLIT FROM 01b ON PURPOSE. parler-tts hard-pins transformers==4.46.1; Gemma 3
-# needs transformers>=4.50. They cannot share a process. The Hub is the
+# SPLIT FROM 01b ON PURPOSE. parler-tts hard-pins transformers==4.46.1; Gemma 4
+# needs transformers>=5.5. They cannot share a process. The Hub is the
 # checkpoint between the two notebooks.
 
 NB01A = notebook([
@@ -96,7 +96,7 @@ Runtime ≈ 2h. Every LLM call is cached, so a 12h timeout costs nothing on a re
 !pip install -q --force-reinstall --no-deps git+{REPO}
 
 import csasr, transformers
-assert csasr.__version__ >= "0.6.0", (
+assert csasr.__version__ >= "0.7.0", (
     f"stale csasr {{csasr.__version__}} - the kernel is running old code. "
     "Restart the kernel (Run > Restart & clear) and re-run this cell."
 )
@@ -140,39 +140,6 @@ def run(*args):
 !nvidia-smi --query-gpu=name,memory.total --format=csv
 """),
 
-    md("## 0b · SMOKE TEST — 10 bigrams before committing 2 hours\n\nLoads Gemma, runs the fp16 health check, and prints real output. If the bigrams are garbage or empty, **stop here** — do not spend two hours finding out."),
-    code("""
-from csasr.llm.backend import TransformersBackend, Sampling
-from csasr.llm.prompts import bigram_messages
-from csasr.llm.gen_bigrams import parse_bigrams
-from csasr.llm.filter_bigrams import script_filter
-
-EXAMPLES = [
-    "इस spoken tutorial में आपका स्वागत है",
-    "यह बुनियादी formatting के बारे में है",
-    "अब हम एक नया document बनाएंगे",
-    "menu bar पर click करें",
-    "फिर आप file को save कर सकते हैं",
-]
-
-be = TransformersBackend(LLM)   # runs the fp16 -> float32 logits healthcheck
-out = be.chat([bigram_messages(EXAMPLES, n=10)], Sampling(temperature=0.9, max_new_tokens=200))
-bigrams = parse_bigrams(out[0])
-
-print("\\nraw completion:\\n", out[0][:400])
-print("\\nparsed bigrams and whether the script filter accepts them:")
-ok = 0
-for b in bigrams:
-    good = script_filter(b)
-    ok += good is not None
-    print(f"   {'PASS' if good else 'drop'}  {b}")
-print(f"\\n{ok}/{len(bigrams)} survive the Devanagari+Latin filter "
-      f"(the paper's raw->valid survival is ~12%, so even 3-5/10 here is healthy)")
-assert bigrams, "Gemma produced NOTHING parseable - stop and investigate"
-del be
-import gc, torch; gc.collect(); torch.cuda.empty_cache()
-"""),
-
     md("## 1 · Pull the in-domain transcripts (few-shot exemplars)\n\nTrack 2 never trains on real code-switched audio — we only need the *text* of the MUCS train split."),
     code("""
 from datasets import load_dataset
@@ -184,7 +151,25 @@ print(f"{len(train_text):,} in-domain sentences for few-shot prompting")
 print(train_text[0]["text"])
 """),
 
-    md("## 2 · Generate bigrams\n\nPaper: 44,657 raw → 5,932 unique (13.3%)."),
+    md("""## 2 · SMOKE TEST — 20 bigrams before committing 2 hours
+
+Loads Gemma, runs the **fp16 → float32 logits health check** (Gemma 4 is bf16-native and
+the T4 has no bf16), generates real bigrams, and shows which survive the script filter.
+
+**It runs as a subprocess, deliberately.** Jupyter's `Out[]` history holds a reference to
+anything a cell produced, so `del model` does *not* free the VRAM — and the next subprocess
+then dies with `Some modules are dispatched on the CPU or the disk`. Keeping the model out
+of the kernel entirely is the only reliable fix.
+
+Expect Gemma to emit **three**-word phrases (`बुनियादी formatting basics`). That is fine: the
+filter extracts the switch pair from inside them. See deviation **D9**."""),
+    code("""
+run("csasr.llm.smoke", "--model", LLM,
+    "--train-manifest", MAN / "mucs_train.jsonl",
+    "--n-calls", "2", "--bigrams-per-call", "10")
+"""),
+
+    md("## 3 · Generate bigrams\n\nPaper: 44,657 raw → 5,932 unique (13.3%)."),
     code("""
 run("csasr.llm.gen_bigrams",
     "--train-manifest", MAN / "mucs_train.jsonl",
@@ -193,7 +178,7 @@ run("csasr.llm.gen_bigrams",
     "--model", LLM, "--n-calls", "4466", "--batch-size", "16")
 """),
 
-    md("## 3 · Filter\n\nDeterministic script filter (one Devanagari token + one Latin token), then an LLM translation check with 3-sample self-consistency.\nPaper: 5,932 unique → 5,477 valid (92.3%)."),
+    md("## 4 · Filter\n\nDeterministic script filter (one Devanagari token + one Latin token), then an LLM translation check with 3-sample self-consistency.\nPaper: 5,932 unique → 5,477 valid (92.3%)."),
     code("""
 run("csasr.llm.filter_bigrams",
     "--raw", MAN / "bigrams_raw.jsonl",
@@ -202,7 +187,7 @@ run("csasr.llm.filter_bigrams",
     "--model", LLM, "--items-per-call", "20", "--n-samples", "3")
 """),
 
-    md("## 4 · Expand each bigram into four sentences\n\n2 English-matrix, 2 Hindi-matrix. Paper: ~16,000 unique from a theoretical 21,908."),
+    md("## 5 · Expand each bigram into four sentences\n\n2 English-matrix, 2 Hindi-matrix. Paper: ~16,000 unique from a theoretical 21,908."),
     code("""
 run("csasr.llm.gen_sentences",
     "--bigrams", MAN / "bigrams_valid.jsonl",
@@ -239,7 +224,7 @@ for r in sents[:5]:
     print("   ", r["text"])
 """),
 
-    md("## 5 · Push the text to the Hub\n\nThis is the handoff to `01b`. Push before anything can time out."),
+    md("## 6 · Push the text to the Hub\n\nThis is the handoff to `01b`. Push before anything can time out."),
     code("""
 for man, cfg in [("bigrams_valid.jsonl", "bigrams"), ("sentences.jsonl", "sentences")]:
     run("csasr.data.push_to_hub", "--manifest", MAN / man,
@@ -281,7 +266,7 @@ costs at most the in-flight shard.
 !pip install -q --force-reinstall --no-deps git+{REPO}
 
 import csasr, transformers
-assert csasr.__version__ >= "0.6.0", (
+assert csasr.__version__ >= "0.7.0", (
     f"stale csasr {{csasr.__version__}} - restart the kernel (Run > Restart & clear)."
 )
 assert transformers.__version__ == "4.46.1", (
@@ -441,7 +426,7 @@ what we test is the **M6 → M7 → M8 ordering**.
 !pip install -q --force-reinstall --no-deps git+{REPO}
 
 import csasr
-assert csasr.__version__ >= "0.6.0", (
+assert csasr.__version__ >= "0.7.0", (
     f"stale csasr {{csasr.__version__}} - the kernel is running old code. "
     "Restart the kernel (Run > Restart & clear) and re-run this cell."
 )
@@ -570,7 +555,7 @@ regrouped into its 30 recordings here — no re-upload.
 !pip install -q --force-reinstall --no-deps git+{REPO}
 
 import csasr
-assert csasr.__version__ >= "0.6.0", (
+assert csasr.__version__ >= "0.7.0", (
     f"stale csasr {{csasr.__version__}} - the kernel is running old code. "
     "Restart the kernel (Run > Restart & clear) and re-run this cell."
 )
