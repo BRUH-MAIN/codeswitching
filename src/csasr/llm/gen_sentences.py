@@ -109,14 +109,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cache", type=Path, default=Path("data/llm_cache/sentences.jsonl"))
     ap.add_argument("--backend", default="transformers")
     ap.add_argument("--model", default="google/gemma-4-E4B-it")
-    ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--max-new-tokens", type=int, default=256)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--max-chars", type=int, default=400, help="Whisper label cap is 448 tokens")
+    # One process per GPU: device_map="auto" fits the model on ONE card and leaves
+    # Kaggle's second T4 completely idle.
+    ap.add_argument("--shard", type=int, default=0)
+    ap.add_argument("--num-shards", type=int, default=1)
     args = ap.parse_args(argv)
 
     bigrams = list(read_jsonl(args.bigrams))
+    if args.num_shards > 1:
+        total = len(bigrams)
+        bigrams = bigrams[args.shard :: args.num_shards]
+        print(f"[gen_sentences] shard {args.shard}/{args.num_shards}: "
+              f"{len(bigrams):,} of {total:,} bigrams")
     print(f"[gen_sentences] {len(bigrams):,} valid bigrams")
 
     convs = [sentence_messages(b["bigram"]) for b in bigrams]

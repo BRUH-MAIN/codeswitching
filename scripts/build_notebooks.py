@@ -98,7 +98,7 @@ Runtime ≈ 2h. Every LLM call is cached, so a 12h timeout costs nothing on a re
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure
 # (the old 01a loaded the model in-kernel and starved every subprocess of VRAM).
-NOTEBOOK_VERSION = "0.8.0"
+NOTEBOOK_VERSION = "0.9.0"
 
 import csasr, transformers
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -145,6 +145,7 @@ def run(*args):
         )
 
 import torch
+N_GPU = max(1, torch.cuda.device_count())
 for i in range(torch.cuda.device_count()):
     free, total = torch.cuda.mem_get_info(i)
     print(f"cuda:{i}  {free/2**30:5.1f} GiB free / {total/2**30:.1f} GiB")
@@ -154,6 +155,39 @@ for i in range(torch.cuda.device_count()):
         "Every subprocess below will then fail with 'Some modules are dispatched on "
         "the CPU or the disk'. Restart the kernel: Run > Restart & clear all."
     )
+
+from csasr.manifest import read_jsonl, write_jsonl
+
+def run_sharded(module, out_path, *args, cache_stem="cache"):
+    \"\"\"Run one process PER GPU and merge the shards.
+
+    `device_map="auto"` puts the whole model on ONE card, so a single process
+    leaves Kaggle's second T4 completely idle. Sharding the work across two
+    processes -- each pinned to its own GPU with CUDA_VISIBLE_DEVICES -- is a
+    straight 2x. Each shard gets its OWN cache file: two writers on one JSONL
+    would interleave and corrupt it.
+    \"\"\"
+    out_path = Path(out_path)
+    procs = []
+    for i in range(N_GPU):
+        cmd = [sys.executable, "-m", module, *[str(a) for a in args],
+               "--cache", str(CACHE / f"{cache_stem}.shard{i}.jsonl"),
+               "--out", str(out_path.with_suffix(f".shard{i}.jsonl")),
+               "--shard", str(i), "--num-shards", str(N_GPU)]
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(i))
+        print(f"> GPU{i}: {module} shard {i}/{N_GPU}", flush=True)
+        procs.append(subprocess.Popen(cmd, env=env))
+
+    for i, p in enumerate(procs):
+        if p.wait() != 0:
+            raise RuntimeError(f"{module} shard {i} failed (exit {p.returncode}). "
+                               "The real error is printed ABOVE - scroll up.")
+
+    rows = [r for i in range(N_GPU)
+            for r in read_jsonl(out_path.with_suffix(f".shard{i}.jsonl"))]
+    write_jsonl(out_path, rows)
+    print(f"merged {len(rows):,} rows -> {out_path}")
+    return rows
 """),
 
     md("## 1 · Pull the in-domain transcripts (few-shot exemplars)\n\nTrack 2 never trains on real code-switched audio — we only need the *text* of the MUCS train split."),
@@ -187,35 +221,31 @@ run("csasr.llm.smoke", "--model", LLM,
 
     md("## 3 · Generate bigrams\n\nPaper: 44,657 raw → 5,932 unique (13.3%)."),
     code("""
-run("csasr.llm.gen_bigrams",
-    "--train-manifest", MAN / "mucs_train.jsonl",
-    "--out", MAN / "bigrams_raw.jsonl",
-    "--cache", CACHE / "bigrams.jsonl",
-    "--model", LLM, "--n-calls", "4466", "--batch-size", "16")
+run_sharded("csasr.llm.gen_bigrams", MAN / "bigrams_raw.jsonl",
+            "--train-manifest", MAN / "mucs_train.jsonl",
+            "--model", LLM, "--n-calls", "4466", "--batch-size", "32",
+            cache_stem="bigrams")
 """),
 
     md("## 4 · Filter\n\nDeterministic script filter (one Devanagari token + one Latin token), then an LLM translation check with 3-sample self-consistency.\nPaper: 5,932 unique → 5,477 valid (92.3%)."),
     code("""
-run("csasr.llm.filter_bigrams",
-    "--raw", MAN / "bigrams_raw.jsonl",
-    "--out", MAN / "bigrams_valid.jsonl",
-    "--cache", CACHE / "transcheck.jsonl",
-    "--model", LLM, "--items-per-call", "20", "--n-samples", "3")
+run_sharded("csasr.llm.filter_bigrams", MAN / "bigrams_valid.jsonl",
+            "--raw", MAN / "bigrams_raw.jsonl",
+            "--model", LLM, "--items-per-call", "20", "--n-samples", "3",
+            "--batch-size", "16",
+            cache_stem="transcheck")
 """),
 
     md("## 5 · Expand each bigram into four sentences\n\n2 English-matrix, 2 Hindi-matrix. Paper: ~16,000 unique from a theoretical 21,908."),
     code("""
-run("csasr.llm.gen_sentences",
-    "--bigrams", MAN / "bigrams_valid.jsonl",
-    "--out", MAN / "sentences.jsonl",
-    "--cache", CACHE / "sentences.jsonl",
-    "--model", LLM, "--batch-size", "16")
+run_sharded("csasr.llm.gen_sentences", MAN / "sentences.jsonl",
+            "--bigrams", MAN / "bigrams_valid.jsonl",
+            "--model", LLM, "--batch-size", "32",
+            cache_stem="sentences")
 """),
 
     md("### GATE 1 — yields must track the paper\n\nA large divergence in the 13.3% dedup rate means the prompt or temperature is off. Decide here, not after 6 hours of TTS."),
     code("""
-from csasr.manifest import read_jsonl
-
 raw   = list(read_jsonl(MAN / "bigrams_raw.jsonl"))
 uniq  = {r["bigram"] for r in raw}
 valid = list(read_jsonl(MAN / "bigrams_valid.jsonl"))
@@ -305,7 +335,7 @@ costs at most the in-flight shard.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.8.0"
+NOTEBOOK_VERSION = "0.9.0"
 
 import csasr, transformers
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -472,7 +502,7 @@ what we test is the **M6 → M7 → M8 ordering**.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.8.0"
+NOTEBOOK_VERSION = "0.9.0"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -607,7 +637,7 @@ regrouped into its 30 recordings here — no re-upload.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.8.0"
+NOTEBOOK_VERSION = "0.9.0"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (

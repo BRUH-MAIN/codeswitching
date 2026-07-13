@@ -98,6 +98,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--strict-bigrams", action="store_true",
                     help="paper-faithful: require exactly two tokens, do not extract "
                          "the switch pair from a longer phrase")
+    # Dedup + script filter are deterministic and cheap, so every shard computes
+    # them identically; only the LLM translation check is split.
+    ap.add_argument("--shard", type=int, default=0)
+    ap.add_argument("--num-shards", type=int, default=1)
     args = ap.parse_args(argv)
 
     raw = [r["bigram"] for r in read_jsonl(args.raw)]
@@ -127,6 +131,12 @@ def main(argv: list[str] | None = None) -> int:
     if n_extracted:
         print(f"[filter]   of which {n_extracted:,} were EXTRACTED from longer phrases "
               f"(the model ignored 'a couple of words'; see script_filter docstring)")
+
+    # Split only the LLM translation check. `pairs` is identical in every shard
+    # (dedup + script filter are deterministic), so slicing it partitions cleanly.
+    if args.num_shards > 1:
+        pairs = pairs[args.shard :: args.num_shards]
+        print(f"[filter] shard {args.shard}/{args.num_shards}: {len(pairs):,} pairs to check")
 
     is_translation: dict[str, bool] = {bg: False for bg, _, _ in pairs}
 
