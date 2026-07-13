@@ -14,8 +14,9 @@ speakers: [Rohit, Divya]            # assigned 50/50 by sha1(sent_id), NOT hash(
 batch_size: 8                       # length-sorted buckets keep padding down
 seed: 1234
 
-# The model emits 22.05 kHz; Whisper wants 16 kHz.
-source_sr: 22050
+# Indic Parler-TTS emits 44.1 kHz (confirmed at runtime; the model card's 22.05 kHz
+# is wrong). synthesize.py reads model.config.sampling_rate rather than trusting this.
+source_sr: 44100
 target_sr: 16000
 
 # Sharding: a 12h Kaggle session that dies costs at most one shard.

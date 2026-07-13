@@ -10,8 +10,9 @@ Design notes:
 *   **Length-sorted batching.** Parler-TTS is autoregressive over audio codec
     frames; batching sentences of similar length keeps padding (and therefore
     wasted decode steps) down.
-*   **16-bit PCM out, never float32.** float32 at 22.05 kHz would be ~7 GB for
-    22 h. We resample to 16 kHz (Whisper's rate) and write int16: ~2.5 GB.
+*   **16-bit PCM out, never float32.** The model emits **44.1 kHz** (read from
+    `model.config.sampling_rate` -- do NOT hardcode it). float32 at 44.1 kHz would
+    be enormous. We resample to 16 kHz (Whisper's rate) and write int16: ~2.5 GB.
 *   **Trailing-silence trim.** Batched generation pads the shorter clips with
     codec silence. Untrimmed, this inflates every duration and therefore the
     corpus hour count.
@@ -55,7 +56,7 @@ MAX_DUR = 30.0  # Whisper's receptive window
 MIN_DUR = 0.5  # anything shorter is a TTS collapse
 
 
-def trim_silence(x: np.ndarray, *, thresh: float = 1e-3, pad_ms: int = 30, sr: int = 22_050) -> np.ndarray:
+def trim_silence(x: np.ndarray, *, thresh: float = 1e-3, pad_ms: int = 30, sr: int = 44_100) -> np.ndarray:
     """Strip leading/trailing near-silence, keeping a short pad."""
     if x.size == 0:
         return x

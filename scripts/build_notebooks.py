@@ -98,7 +98,7 @@ Runtime ≈ 2h. Every LLM call is cached, so a 12h timeout costs nothing on a re
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure
 # (the old 01a loaded the model in-kernel and starved every subprocess of VRAM).
-NOTEBOOK_VERSION = "0.9.2"
+NOTEBOOK_VERSION = "0.9.3"
 
 import csasr, transformers
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -335,7 +335,7 @@ costs at most the in-flight shard.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.9.2"
+NOTEBOOK_VERSION = "0.9.3"
 
 import csasr, transformers
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -447,8 +447,8 @@ print(ds[0]["text"])
 
     md("""## 2 · Synthesize
 
-Indic Parler-TTS emits 22.05 kHz → resampled to 16 kHz and written as **int16** (float32
-would be 7 GB rather than 2.5 GB).
+Indic Parler-TTS emits **44.1 kHz** → resampled to 16 kHz and written as **int16**
+(`synthesize.py` reads `model.config.sampling_rate`; it never hardcodes the rate).
 
 **Both GPUs, in parallel.** Shards run two at a time, one per T4 — running them
 sequentially would leave half the machine idle, which is exactly the waste already fixed in
@@ -550,7 +550,7 @@ what we test is the **M6 → M7 → M8 ordering**.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.9.2"
+NOTEBOOK_VERSION = "0.9.3"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -685,7 +685,7 @@ regrouped into its 30 recordings here — no re-upload.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.9.2"
+NOTEBOOK_VERSION = "0.9.3"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (
