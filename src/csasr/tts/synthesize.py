@@ -19,6 +19,25 @@ Design notes:
 
 from __future__ import annotations
 
+import os
+
+# MUST precede any `import transformers`. `parler_tts` imports
+# `transformers.PreTrainedModel`, which pulls in `modeling_utils` ->
+# `loss_deformable_detr` -> `image_transforms`, and THAT does
+#
+#     if is_tf_available():
+#         import tensorflow as tf
+#
+# On Kaggle TensorFlow is installed but wants a newer `protobuf` than the one our
+# pins leave behind, so the import dies with
+#
+#     ImportError: cannot import name 'runtime_version' from 'google.protobuf'
+#
+# We never use TensorFlow. `USE_TF=0` makes `is_tf_available()` return False and
+# the import never happens.
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_TORCH", "1")
+
 import argparse
 import sys
 from pathlib import Path

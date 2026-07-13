@@ -98,7 +98,7 @@ Runtime ≈ 2h. Every LLM call is cached, so a 12h timeout costs nothing on a re
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure
 # (the old 01a loaded the model in-kernel and starved every subprocess of VRAM).
-NOTEBOOK_VERSION = "0.9.1"
+NOTEBOOK_VERSION = "0.9.2"
 
 import csasr, transformers
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -335,7 +335,7 @@ costs at most the in-flight shard.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.9.1"
+NOTEBOOK_VERSION = "0.9.2"
 
 import csasr, transformers
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -358,15 +358,27 @@ from pathlib import Path
 os.environ["HF_HOME"] = "/kaggle/temp/hf"
 Path(os.environ["HF_HOME"]).mkdir(parents=True, exist_ok=True)
 
+# NEVER let transformers import TensorFlow. `parler_tts` imports
+# `transformers.PreTrainedModel`, which reaches image_transforms.py and runs
+# `if is_tf_available(): import tensorflow`. Kaggle HAS TensorFlow, but it wants a
+# newer protobuf than our pins leave behind, so it dies with
+#   ImportError: cannot import name 'runtime_version' from 'google.protobuf'
+# We never use TF. USE_TF=0 makes is_tf_available() False and the import vanishes.
+os.environ["USE_TF"] = "0"
+os.environ["USE_TORCH"] = "1"
+
 from kaggle_secrets import UserSecretsClient
 os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
 from huggingface_hub import login
 login(token=os.environ["HF_TOKEN"])
 HF_TOKEN = os.environ["HF_TOKEN"]
 
+import torch
+N_GPU = max(1, torch.cuda.device_count())
+
 SYNTH_REPO = "RohanRamesh/hi-en-synth-cs"
 TTS        = "ai4bharat/indic-parler-tts"
-NUM_SHARDS = 4
+NUM_SHARDS = 4          # finer than N_GPU on purpose: a timeout costs one shard
 
 WORK  = Path("/kaggle/working")
 MAN   = WORK / "manifests"; MAN.mkdir(parents=True, exist_ok=True)
@@ -381,6 +393,25 @@ def run(*args):
             f"this traceback - scroll up in this cell's output."
         )
 
+def run_parallel(cmds):
+    \"\"\"One process per GPU, pinned with CUDA_VISIBLE_DEVICES; wait for all.
+
+    Running the shards SEQUENTIALLY leaves Kaggle's second T4 completely idle --
+    the same waste already fixed in 01a and 03_eval.
+    \"\"\"
+    procs = []
+    for i, cmd in enumerate(cmds):
+        gpu = i % N_GPU
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu))
+        print(f"> GPU{gpu}: {' '.join(str(c) for c in cmd)}", flush=True)
+        procs.append(subprocess.Popen(
+            [sys.executable, "-m", *[str(c) for c in cmd]], env=env))
+    for i, p in enumerate(procs):
+        if p.wait() != 0:
+            raise RuntimeError(f"shard {i} failed (exit {p.returncode}). The real error "
+                               "is printed ABOVE - scroll up in this cell's output.")
+
+print(f"{N_GPU} GPU(s), {NUM_SHARDS} shards")
 !nvidia-smi --query-gpu=name,memory.total --format=csv
 """),
 
@@ -414,15 +445,32 @@ print(f"{len(ds):,} sentences to synthesize")
 print(ds[0]["text"])
 """),
 
-    md("## 2 · Synthesize\n\nIndic Parler-TTS emits 22.05 kHz → resampled to 16 kHz and written as **int16** (float32 would be 7 GB rather than 2.5 GB).\n\nSharded: re-run this cell after a timeout and it skips whatever already exists on disk."),
+    md("""## 2 · Synthesize
+
+Indic Parler-TTS emits 22.05 kHz → resampled to 16 kHz and written as **int16** (float32
+would be 7 GB rather than 2.5 GB).
+
+**Both GPUs, in parallel.** Shards run two at a time, one per T4 — running them
+sequentially would leave half the machine idle, which is exactly the waste already fixed in
+01a and 03_eval.
+
+**Resumable.** Every clip already on disk is skipped, so re-running this cell after a
+timeout costs only the in-flight batch."""),
     code("""
-for shard in range(NUM_SHARDS):
-    run("csasr.tts.synthesize",
-        "--sentences", MAN / "sentences.jsonl",
-        "--audio-dir", AUDIO,
-        "--out", MAN / f"train_t2.shard{shard}.jsonl",
-        "--shard", str(shard), "--num-shards", str(NUM_SHARDS),
-        "--batch-size", "8")
+BATCH = 16     # Parler is small (938M); 8 left the GPU underfed
+
+# Two shards at a time -- one per GPU.
+for start in range(0, NUM_SHARDS, N_GPU):
+    group = range(start, min(start + N_GPU, NUM_SHARDS))
+    run_parallel([
+        ["csasr.tts.synthesize",
+         "--sentences", MAN / "sentences.jsonl",
+         "--audio-dir", AUDIO,
+         "--out", MAN / f"train_t2.shard{s}.jsonl",
+         "--shard", s, "--num-shards", NUM_SHARDS,
+         "--batch-size", BATCH]
+        for s in group
+    ])
 """),
 
     md("## 3 · Merge shards, build Train_T1 by reference\n\n### GATE 2 — `Train_T1 ⊆ Train_T2`, durations ≈ 8h / 22h"),
@@ -502,7 +550,7 @@ what we test is the **M6 → M7 → M8 ordering**.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.9.1"
+NOTEBOOK_VERSION = "0.9.2"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -637,7 +685,7 @@ regrouped into its 30 recordings here — no re-upload.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.9.1"
+NOTEBOOK_VERSION = "0.9.2"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (
