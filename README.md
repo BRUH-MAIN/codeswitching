@@ -64,6 +64,7 @@ Each is cheap relative to what it protects. **Run them in this order.**
 | **0** | `verify_table1.py` reproduces the paper's Table 1 word and bigram counts | CPU, seconds |
 | **1** | Bigram yield ratios track the paper (13.3% dedup, 92.3% filter) | free (end of Stage 1) |
 | **2** | `Train_T1 ⊆ Train_T2`; durations ≈ 8h / 22h; spot-listen | free (end of Stage 2) |
+| **1.5** | `audit_sentences.py` — label leaks, script mix, switch density, domain overlap, projected TTS hours | CPU, seconds |
 | **3** | `whisper-large-v2` zero-shot ≈ **52.0 MER / 42.9 CBA-HE** | ~15 min on a T4 |
 
 Gate 3 is inference-only and validates decoding, normalization, language ID, and
@@ -323,6 +324,8 @@ a log, revoke it at [hf.co/settings/tokens](https://huggingface.co/settings/toke
 | **D6** | 4h dev from real train | same, **plus** a synthetic-only dev logged alongside | The paper's dev set is real in-domain audio, a mild leak against its "no real data" claim. |
 | **D7** | 15h Common Voice Hindi | **11.87h** | CV 17 Hindi holds only ~20.6h across `dev`+`test`+`train`+`other`; after the 1–30s duration filter and clips missing from the per-split TSVs, 11.87h is all that exists. English is the full 15.00h. Affects M8 only. |
 | **D8** | Per-utterance MER / CBA | **recording-level** MER / CBA | Forced by D4. MER is a corpus-level ratio, so concatenation is equivalent. CBA's denominator still comes from the reference *utterances* (Table 1's count). |
+| **D10** | Train_T2 = 22h | **~15.6h** (estimated) | Gemma's sentences are short (median 8 words), so 15,733 of them yields ~15.6h rather than the paper's 22h. Train_T1 (8h) is unaffected; M7 trains on less audio than theirs. |
+| **D11** | Synthetic matches the domain | **Off-distribution** | The synthetic corpus is **53% Devanagari / 47% Latin** against the real corpus's **74% / 25%**, and averages **1.96** switch points per sentence against **3.15**. Token-level English vocabulary overlap is a healthy 88.3%, so the words come from the right domain — but the *mixture* is markedly more English-heavy and switches less. A direct consequence of D1. |
 | **D9** | LLM obeys "a couple of words" | **We extract the switch pair from longer phrases** | The paper's 70B emitted true bigrams. Gemma 4 reliably appends a third word (`बुनियादी formatting basics`). Demanding exactly two tokens threw away **10/10** of a real Gemma-4 sample even though **8** carried a valid switch point. The *prompt* stays verbatim; only `script_filter` is more forgiving. `--strict-bigrams` restores the paper-faithful behaviour. |
 
 D1 and D2 both cost quality, so **absolute MER will not match Table 2**. The claim

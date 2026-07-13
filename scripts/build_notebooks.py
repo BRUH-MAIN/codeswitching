@@ -98,7 +98,7 @@ Runtime ≈ 2h. Every LLM call is cached, so a 12h timeout costs nothing on a re
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure
 # (the old 01a loaded the model in-kernel and starved every subprocess of VRAM).
-NOTEBOOK_VERSION = "0.9.0"
+NOTEBOOK_VERSION = "0.9.1"
 
 import csasr, transformers
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -335,7 +335,7 @@ costs at most the in-flight shard.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.9.0"
+NOTEBOOK_VERSION = "0.9.1"
 
 import csasr, transformers
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -502,7 +502,7 @@ what we test is the **M6 → M7 → M8 ordering**.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.9.0"
+NOTEBOOK_VERSION = "0.9.1"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -637,7 +637,7 @@ regrouped into its 30 recordings here — no re-upload.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.9.0"
+NOTEBOOK_VERSION = "0.9.1"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (
