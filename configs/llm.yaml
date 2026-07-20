@@ -2,38 +2,34 @@
 #
 # DEVIATION D1 from the paper, which used Llama-3.3-70B-Instruct (141 GB bf16).
 #
-# We use Gemma 4 E4B instead: ~8B raw parameters, apache-2.0, UNGATED (no licence
-# click-through, no gated-repo token scope -- unlike Gemma 3, whose google/* repos
-# are gated). Pretrained on 140+ languages, so Devanagari is well covered. A
-# deterministic script filter (filter_bigrams.py) sits behind it to catch what it
-# still gets wrong.
+# We serve Gemma 4 26B-A4B via llama.cpp: a 25.2B-total / 3.8B-active MoE,
+# apache-2.0, UNGATED. Far stronger than the earlier dense E4B (which is why we
+# switched -- see D11: E4B's output was too English-heavy and switched too little).
+#
+# Runtime shape:
+#   * ~16 GB in Q4_K_M -> does NOT fit one T4. `tensor_split` spreads the ONE
+#     model across both cards, so there is a SINGLE process using both GPUs.
+#     Unlike the transformers path, there is NO cross-GPU sharding here.
+#   * llama.cpp chat completions are single-stream, so the whole run is slow
+#     (~8-12 h). Disabling the model's thinking is what keeps it feasible; every
+#     call is cached, so a 12 h session cap is survived by re-running.
 #
 # Why NOT vLLM: its AWQ kernels need compute capability >= 8.0. Kaggle's T4 is
 # sm75 and raises "quantization method awq is not supported for the current GPU".
-#
-# THREE DEFENCES in backend.py, verified against the real config:
-#   1. Gemma 4 is `Gemma4ForConditionalGeneration` (text + vision + audio). It is
-#      ALSO registered under AutoModelForCausalLM, so that binds -- but Gemma 3
-#      4B+ is image-text and does not. backend.py walks the auto-classes.
-#   2. Gemma 4's chat template DOES support a `system` role, so the paper's
-#      verbatim system prompt survives intact. (Gemma 2's rejects it; backend.py
-#      folds it into the first user turn in that case.)
-#   3. LIVE RISK: Gemma 4's config declares `torch_dtype: bfloat16` and the T4 has
-#      NO bf16. fp16 activations can exceed 65,504 and go non-finite. backend.py
-#      probes the logits after loading and reloads with float32 compute if so.
-#
-# Gemma 4 requires transformers >= 5.5 (its config says 5.5.0.dev0), which is
-# irreconcilable with parler-tts's transformers==4.46.1 pin. Hence the text and
-# audio stages are SEPARATE notebooks (01a / 01b), with the Hub between them.
 
-backend: transformers
-model: google/gemma-4-E4B-it       # ungated, apache-2.0. ~8B raw / "E4B" effective.
+backend: llamacpp
+model: unsloth/gemma-4-26B-A4B-it-GGUF
+gguf_file: gemma-4-26B-A4B-it-UD-Q4_K_M.gguf
 # Alternatives:
-#   google/gemma-4-E2B-it          smaller; try if E4B OOMs, but weaker Devanagari
-#   unsloth/gemma-3-4b-it          needs only transformers>=4.50
-#   Qwen/Qwen2.5-7B-Instruct       fp16-safe (not bf16-native), no T4 dtype risk
-load_in_4bit: true
-dtype: float16        # T4 is Turing: no bf16. Auto-falls back to float32 on overflow.
+#   backend: transformers, model: google/gemma-4-E4B-it   # dense 4B, batched, shardable
+#   backend: transformers, model: Qwen/Qwen2.5-7B-Instruct
+
+llamacpp:
+  n_gpu_layers: -1           # offload every layer
+  n_ctx: 4096
+  tensor_split: [0.5, 0.5]   # even across the 2x T4; auto-computed if omitted
+  top_k: 64                  # model card's recommended setting
+  disable_thinking: true     # tries enable_thinking=False, then strips reasoning
 
 bigrams:
   n_calls: 4466              # 4466 x 10 ~= the paper's 44,657 raw bigrams
@@ -41,18 +37,15 @@ bigrams:
   sentences_per_prompt: 5    # paper: "batches of five Hindi-English sentences"
   temperature: 0.9
   max_new_tokens: 200
-  batch_size: 16
 
 translation_check:
-  items_per_call: 20         # batched so this stage does not dominate the budget
-  n_samples: 3               # self-consistency: an 8B judge is noisier than a 70B
+  items_per_call: 20
+  n_samples: 3               # self-consistency majority vote
   temperature: 0.7
-  batch_size: 8
 
 sentences:
   temperature: 0.8
   max_new_tokens: 256
-  batch_size: 16
   max_chars: 400             # Whisper's label cap is 448 tokens
 
 cache_dir: data/llm_cache    # every call is cached: the run survives a 12h timeout
@@ -61,6 +54,6 @@ seed: 1234
 # GATE 1 targets (paper §3.2.1-3.2.2)
 expect:
   raw_bigrams: 44657
-  unique_bigrams: 5932       # 13.3% survive dedup
-  valid_bigrams: 5477        # 92.3% of unique survive filtering
-  sentences: 16000           # from a theoretical 5477 x 4 = 21,908
+  unique_bigrams: 5932
+  valid_bigrams: 5477
+  sentences: 16000

@@ -51,8 +51,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--train-manifest", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--cache", type=Path, default=Path("data/llm_cache/bigrams.jsonl"))
-    ap.add_argument("--backend", default="transformers")
-    ap.add_argument("--model", default="google/gemma-4-E4B-it")
+    ap.add_argument("--backend", default="llamacpp")
+    ap.add_argument("--model", default="unsloth/gemma-4-26B-A4B-it-GGUF")
+    ap.add_argument("--gguf-file", default="gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
+                    help="llama.cpp only: GGUF filename in the --model repo")
     ap.add_argument("--n-calls", type=int, default=4466, help="~44,657 / 10 per call")
     ap.add_argument("--bigrams-per-call", type=int, default=10)
     ap.add_argument("--sentences-per-prompt", type=int, default=5)
@@ -87,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[gen_bigrams] shard {args.shard}/{args.num_shards}: "
               f"{len(convs):,} of {args.n_calls:,} calls")
 
-    backend = build_backend(args.backend, model_id=args.model)
+    backend = build_backend(args.backend, model_id=args.model, filename=args.gguf_file)
     sampling = Sampling(
         temperature=args.temperature, max_new_tokens=args.max_new_tokens, seed=args.seed
     )

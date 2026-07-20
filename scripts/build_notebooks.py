@@ -59,59 +59,60 @@ NB01A = notebook([
 
 Replication of Biswas et al., Interspeech 2025 (Track 2).
 
-Few-shot-prompt **Gemma 4 E4B** for Hindi-English bigrams → filter them → expand each
-into four sentences (~16k). Push the text to `RohanRamesh/hi-en-synth-cs`.
+Few-shot-prompt **Gemma 4 26B-A4B** (served by **llama.cpp**) for Hindi-English bigrams →
+filter them → expand each into four sentences (~16k). Push the text to
+`RohanRamesh/hi-en-synth-cs`.
 
-Audio synthesis is a **separate notebook** (`01b`). `parler-tts` hard-pins
-`transformers==4.46.1`, Gemma 4 needs `transformers>=5.5` — they cannot coexist in one
-process. The Hub is the checkpoint between them.
+Audio synthesis is a **separate notebook** (`01b`). It needs `transformers==4.46.1` for
+parler-tts; the LLM stage here needs neither that pin nor transformers at all (llama.cpp
+uses the GGUF's own chat template). The Hub is the checkpoint between them.
 
-### The model: `google/gemma-4-E4B-it`
-* **apache-2.0, ungated** — no licence click-through, no gated-repo token scope, no mirror
-  needed. (Gemma 3's `google/*` repos *are* gated; Gemma 4's are not.)
-* Deviation **D1**: the paper used Llama-3.3-70B (141 GB bf16). Gemma 4 E4B is ~8B raw
-  params, pretrained on 140+ languages, and a **deterministic script filter** sits behind it
-  to catch what it still gets wrong.
-* The one **live risk**: Gemma 4 is **bf16-native** (`torch_dtype: bfloat16`) and the T4 is
-  Turing — it has **no bf16**. fp16 activations can exceed 65,504 and go non-finite.
-  `backend.py` probes the logits after loading and transparently reloads with float32 compute
-  if they are NaN/inf. **The smoke test below is how you find out**, in about a minute.
-* Two non-issues, confirmed against the real config (the backend defends against both anyway):
-  it is `Gemma4ForConditionalGeneration` but *is* registered under `AutoModelForCausalLM`, and
-  its chat template **does** support a `system` role — so the paper's verbatim system prompt
-  survives intact.
+### The model: `unsloth/gemma-4-26B-A4B-it-GGUF`
+* **apache-2.0, ungated.** A 25.2B-total / **3.8B-active** MoE — far stronger than the dense
+  E4B used earlier, which produced text that was too English-heavy and switched too little
+  (deviation D11). This should fix that.
+* Served by **llama.cpp** (`backend: llamacpp`), Q4_K_M ≈ 16 GB. That does **not** fit one
+  T4, so `tensor_split=[0.5, 0.5]` spreads the single model across **both** cards.
+* **Consequences, stated plainly:**
+  - *One process, both GPUs.* No cross-GPU sharding here — both T4s hold the one model. The
+    per-GPU sharding used for the dense E4B does not apply.
+  - *Single-stream and slow.* llama.cpp chat completions are sequential, so the full run is
+    ~8–12 h. Every call is cached, so a 12 h session cap is survived by re-running.
+  - *Thinking is disabled* (`disable_thinking: true`) — reasoning tokens would multiply the
+    runtime. The backend tries `enable_thinking=False` and strips any reasoning that leaks;
+    the smoke test flags it if thinking survives.
 
 ### Before you run
 * HF **write** token in Kaggle Secrets as `HF_TOKEN`. Internet **on**, **GPU T4 ×2**.
-* Nothing to accept — Gemma 4 is apache-2.0. (Parler-TTS *is* gated; that bites in `01b`.)
+* Nothing to accept — the model is apache-2.0. (Parler-TTS *is* gated; that bites in `01b`.)
 
-Runtime ≈ 2h. Every LLM call is cached, so a 12h timeout costs nothing on a re-run.
+Every LLM call is cached, so a 12 h timeout costs nothing on a re-run.
 """),
 
-    md("## 0 · Install"),
+    md("## 0 · Install\n\nThe cu121 **prebuilt** llama-cpp-python wheel (with CUDA offload) — no 15-minute compile. NO transformers/parler-tts here."),
     code(f"""
-# Gemma 4 needs transformers >= 5.5. NO parler-tts here -- that is 01b's problem.
-!pip install -q -U "transformers>=5.5" accelerate bitsandbytes
-!pip install -q "datasets<4" librosa soundfile soxr omegaconf rich
+# Prebuilt CUDA wheel: ships with GPU offload, avoids a long source build.
+!CMAKE_ARGS="-DLLAMA_CUBLAS=on" pip install -q llama-cpp-python -U --force-reinstall --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+!pip install -q "datasets<4" librosa soundfile soxr omegaconf rich huggingface_hub
 !pip install -q --force-reinstall --no-deps git+{REPO}
 
-# This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
-# .ipynb -- an old notebook against a new package is a real and confusing failure
-# (the old 01a loaded the model in-kernel and starved every subprocess of VRAM).
-NOTEBOOK_VERSION = "0.9.3"
+NOTEBOOK_VERSION = "0.10.0"
 
-import csasr, transformers
+import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (
     f"csasr package is {{csasr.__version__}} but this NOTEBOOK is {{NOTEBOOK_VERSION}}.\\n"
     "  package older  -> restart the kernel (Run > Restart & clear); pip skips a\\n"
     "                    reinstall when the version looks satisfied.\\n"
     "  notebook older -> re-download it from the repo; pip does NOT update .ipynb files."
 )
-from packaging.version import Version
-assert Version(transformers.__version__) >= Version("5.5"), (
-    f"transformers {{transformers.__version__}} cannot load Gemma 4 (needs >= 5.5)."
+
+import llama_cpp
+print("csasr", csasr.__version__, "| llama_cpp", llama_cpp.__version__,
+      "| GPU offload:", llama_cpp.llama_supports_gpu_offload())
+assert llama_cpp.llama_supports_gpu_offload(), (
+    "llama.cpp has no GPU offload -- the CPU-only wheel got installed. "
+    "Re-run the cu121 --extra-index-url line above."
 )
-print("csasr", csasr.__version__, "| transformers", transformers.__version__)
 """),
 
     code("""
@@ -129,7 +130,10 @@ HF_TOKEN = os.environ["HF_TOKEN"]
 
 REAL_REPO  = "RohanRamesh/mucs-he-cs"
 SYNTH_REPO = "RohanRamesh/hi-en-synth-cs"
-LLM        = "google/gemma-4-E4B-it"      # apache-2.0, ungated. E2B is the smaller option.
+# llama.cpp serves this GGUF split across BOTH T4s (tensor_split). One process,
+# both GPUs -- so no per-GPU sharding here (unlike the old dense-model notebook).
+LLM  = "unsloth/gemma-4-26B-A4B-it-GGUF"
+GGUF = "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
 
 WORK  = Path("/kaggle/working")
 MAN   = WORK / "manifests"; MAN.mkdir(parents=True, exist_ok=True)
@@ -144,50 +148,18 @@ def run(*args):
             f"this traceback - scroll up in this cell's output."
         )
 
-import torch
-N_GPU = max(1, torch.cuda.device_count())
-for i in range(torch.cuda.device_count()):
-    free, total = torch.cuda.mem_get_info(i)
-    print(f"cuda:{i}  {free/2**30:5.1f} GiB free / {total/2**30:.1f} GiB")
-    assert free / total > 0.85, (
-        f"cuda:{i} already has {(total-free)/2**30:.1f} GiB in use. Something in THIS "
-        "kernel is holding the GPU (an older notebook loaded the model in-cell). "
-        "Every subprocess below will then fail with 'Some modules are dispatched on "
-        "the CPU or the disk'. Restart the kernel: Run > Restart & clear all."
-    )
+def gen(module, *args):
+    \"\"\"Run one LLM stage. The model spans both GPUs via tensor_split, so this is
+    a single subprocess -- NOT sharded. Cache makes it resumable across sessions.\"\"\"
+    run(module, *args, "--backend", "llamacpp", "--model", LLM, "--gguf-file", GGUF)
 
 from csasr.manifest import read_jsonl, write_jsonl
 
-def run_sharded(module, out_path, *args, cache_stem="cache"):
-    \"\"\"Run one process PER GPU and merge the shards.
-
-    `device_map="auto"` puts the whole model on ONE card, so a single process
-    leaves Kaggle's second T4 completely idle. Sharding the work across two
-    processes -- each pinned to its own GPU with CUDA_VISIBLE_DEVICES -- is a
-    straight 2x. Each shard gets its OWN cache file: two writers on one JSONL
-    would interleave and corrupt it.
-    \"\"\"
-    out_path = Path(out_path)
-    procs = []
-    for i in range(N_GPU):
-        cmd = [sys.executable, "-m", module, *[str(a) for a in args],
-               "--cache", str(CACHE / f"{cache_stem}.shard{i}.jsonl"),
-               "--out", str(out_path.with_suffix(f".shard{i}.jsonl")),
-               "--shard", str(i), "--num-shards", str(N_GPU)]
-        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(i))
-        print(f"> GPU{i}: {module} shard {i}/{N_GPU}", flush=True)
-        procs.append(subprocess.Popen(cmd, env=env))
-
-    for i, p in enumerate(procs):
-        if p.wait() != 0:
-            raise RuntimeError(f"{module} shard {i} failed (exit {p.returncode}). "
-                               "The real error is printed ABOVE - scroll up.")
-
-    rows = [r for i in range(N_GPU)
-            for r in read_jsonl(out_path.with_suffix(f".shard{i}.jsonl"))]
-    write_jsonl(out_path, rows)
-    print(f"merged {len(rows):,} rows -> {out_path}")
-    return rows
+import torch
+for i in range(torch.cuda.device_count()):
+    free, total = torch.cuda.mem_get_info(i)
+    print(f"cuda:{i}  {free/2**30:5.1f} GiB free / {total/2**30:.1f} GiB")
+!nvidia-smi --query-gpu=name,memory.total --format=csv
 """),
 
     md("## 1 · Pull the in-domain transcripts (few-shot exemplars)\n\nTrack 2 never trains on real code-switched audio — we only need the *text* of the MUCS train split."),
@@ -201,47 +173,49 @@ print(f"{len(train_text):,} in-domain sentences for few-shot prompting")
 print(train_text[0]["text"])
 """),
 
-    md("""## 2 · SMOKE TEST — 20 bigrams before committing 2 hours
+    md("""## 2 · SMOKE TEST — load the model, generate 20 bigrams
 
-Loads Gemma, runs the **fp16 → float32 logits health check** (Gemma 4 is bf16-native and
-the T4 has no bf16), generates real bigrams, and shows which survive the script filter.
+Loads the 26B GGUF across both T4s, generates real bigrams, and shows which survive the
+script filter — in a few minutes, before committing to the ~8–12 h full run.
 
-**It runs as a subprocess, deliberately.** Jupyter's `Out[]` history holds a reference to
-anything a cell produced, so `del model` does *not* free the VRAM — and the next subprocess
-then dies with `Some modules are dispatched on the CPU or the disk`. Keeping the model out
-of the kernel entirely is the only reliable fix.
+**It runs as a subprocess**, so the model is freed cleanly before the real stages start
+(Jupyter's `Out[]` history would otherwise pin the VRAM).
 
-Expect Gemma to emit **three**-word phrases (`बुनियादी formatting basics`). That is fine: the
-filter extracts the switch pair from inside them. See deviation **D9**."""),
+Two things to check in the output:
+* **thinking is off** — if the smoke test warns that `<think>`/`<|channel|>` markers survived,
+  stop and tell the maintainer;
+* Gemma often emits **three**-word phrases (`बुनियादी formatting basics`); the filter extracts
+  the switch pair from inside them (deviation **D9**), so that is fine."""),
     code("""
-run("csasr.llm.smoke", "--model", LLM,
+run("csasr.llm.smoke", "--backend", "llamacpp", "--model", LLM, "--gguf-file", GGUF,
     "--train-manifest", MAN / "mucs_train.jsonl",
     "--n-calls", "2", "--bigrams-per-call", "10")
 """),
 
-    md("## 3 · Generate bigrams\n\nPaper: 44,657 raw → 5,932 unique (13.3%)."),
+    md("## 3 · Generate bigrams\n\nPaper: 44,657 raw → 5,932 unique (13.3%). Single process, both GPUs, cached — safe to re-run after a session timeout."),
     code("""
-run_sharded("csasr.llm.gen_bigrams", MAN / "bigrams_raw.jsonl",
-            "--train-manifest", MAN / "mucs_train.jsonl",
-            "--model", LLM, "--n-calls", "4466", "--batch-size", "32",
-            cache_stem="bigrams")
+gen("csasr.llm.gen_bigrams",
+    "--train-manifest", MAN / "mucs_train.jsonl",
+    "--out", MAN / "bigrams_raw.jsonl",
+    "--cache", CACHE / "bigrams.jsonl",
+    "--n-calls", "4466")
 """),
 
     md("## 4 · Filter\n\nDeterministic script filter (one Devanagari token + one Latin token), then an LLM translation check with 3-sample self-consistency.\nPaper: 5,932 unique → 5,477 valid (92.3%)."),
     code("""
-run_sharded("csasr.llm.filter_bigrams", MAN / "bigrams_valid.jsonl",
-            "--raw", MAN / "bigrams_raw.jsonl",
-            "--model", LLM, "--items-per-call", "20", "--n-samples", "3",
-            "--batch-size", "16",
-            cache_stem="transcheck")
+gen("csasr.llm.filter_bigrams",
+    "--raw", MAN / "bigrams_raw.jsonl",
+    "--out", MAN / "bigrams_valid.jsonl",
+    "--cache", CACHE / "transcheck.jsonl",
+    "--items-per-call", "20", "--n-samples", "3")
 """),
 
     md("## 5 · Expand each bigram into four sentences\n\n2 English-matrix, 2 Hindi-matrix. Paper: ~16,000 unique from a theoretical 21,908."),
     code("""
-run_sharded("csasr.llm.gen_sentences", MAN / "sentences.jsonl",
-            "--bigrams", MAN / "bigrams_valid.jsonl",
-            "--model", LLM, "--batch-size", "32",
-            cache_stem="sentences")
+gen("csasr.llm.gen_sentences",
+    "--bigrams", MAN / "bigrams_valid.jsonl",
+    "--out", MAN / "sentences.jsonl",
+    "--cache", CACHE / "sentences.jsonl")
 """),
 
     md("### GATE 1 — yields must track the paper\n\nA large divergence in the 13.3% dedup rate means the prompt or temperature is off. Decide here, not after 6 hours of TTS."),
@@ -262,7 +236,7 @@ for name, got, want, surv in rows:
     s = f"{surv:.1%}" if surv else "-"
     print(f"{name:<16}{got:>10,}{want:>10,}{s:>12}")
 print("\\npaper survival: dedup 13.3%, filter 92.3%")
-print("\\nGemma 4 E4B is far smaller than the paper's 70B (deviation D1), so a lower")
+print("\\nGemma 4 26B-A4B is smaller than the paper's 70B (deviation D1), so a lower")
 print("valid-bigram yield is expected. What matters is that ENOUGH sentences survive:")
 print(f"  -> {len(sents):,} sentences  (need >~8,000 for a usable 22h corpus)")
 
@@ -335,7 +309,7 @@ costs at most the in-flight shard.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.9.3"
+NOTEBOOK_VERSION = "0.10.0"
 
 import csasr, transformers
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -550,7 +524,7 @@ what we test is the **M6 → M7 → M8 ordering**.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.9.3"
+NOTEBOOK_VERSION = "0.10.0"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -685,7 +659,7 @@ regrouped into its 30 recordings here — no re-upload.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.9.3"
+NOTEBOOK_VERSION = "0.10.0"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (

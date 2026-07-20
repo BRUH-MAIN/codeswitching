@@ -107,8 +107,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--bigrams", type=Path, required=True, help="bigrams_valid.jsonl")
     ap.add_argument("--out", type=Path, required=True, help="sentences.jsonl")
     ap.add_argument("--cache", type=Path, default=Path("data/llm_cache/sentences.jsonl"))
-    ap.add_argument("--backend", default="transformers")
-    ap.add_argument("--model", default="google/gemma-4-E4B-it")
+    ap.add_argument("--backend", default="llamacpp")
+    ap.add_argument("--model", default="unsloth/gemma-4-26B-A4B-it-GGUF")
+    ap.add_argument("--gguf-file", default="gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
+                    help="llama.cpp only: GGUF filename in the --model repo")
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--max-new-tokens", type=int, default=256)
@@ -129,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[gen_sentences] {len(bigrams):,} valid bigrams")
 
     convs = [sentence_messages(b["bigram"]) for b in bigrams]
-    backend = build_backend(args.backend, model_id=args.model)
+    backend = build_backend(args.backend, model_id=args.model, filename=args.gguf_file)
     sampling = Sampling(
         temperature=args.temperature, max_new_tokens=args.max_new_tokens, seed=args.seed
     )

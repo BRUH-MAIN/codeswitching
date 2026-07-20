@@ -1,30 +1,33 @@
 """LLM serving backends.
 
-Why not vLLM: its AWQ kernels require compute capability >= 8.0 (Ampere). Kaggle
-gives Turing T4s (sm75), which raise
-`The quantization method awq is not supported for the current GPU`.
+TWO backends, selected by config `backend:`.
 
-Why not llama.cpp on Kaggle: the high-level Python binding is single-stream.
-At ~60 tok/s the ~1.4M output tokens of a full run take >6h, which does not fit
-alongside TTS in one 12h session.
+* `LlamaCppBackend` (DEFAULT) -- GGUF via llama-cpp-python, serving
+  `unsloth/gemma-4-26B-A4B-it-GGUF` (25.2B / 3.8B-active MoE, ~16 GB Q4_K_M)
+  split across both T4s with `tensor_split`. Far stronger than the dense E4B.
+  Single-stream (llama.cpp chat completions are sequential), so the run is slow;
+  disabling the model's thinking is what keeps it feasible. One process, both
+  GPUs -- so no cross-GPU sharding here, unlike the transformers path.
 
-So the workhorse is `TransformersBackend`: bitsandbytes NF4 + *batched* generate.
+* `TransformersBackend` -- bitsandbytes NF4 + *batched* generate. Kept as an
+  alternative (config `backend: transformers`); this is what the earlier E4B runs
+  used, and it batches, so it shards across GPUs cleanly.
+
+Why not vLLM on Kaggle: its AWQ kernels require compute capability >= 8.0
+(Ampere). The T4 is sm75 and raises "quantization method awq is not supported".
 
 WHY THE TEXT AND AUDIO STAGES LIVE IN SEPARATE NOTEBOOKS
 --------------------------------------------------------
-`parler-tts` hard-pins `transformers==4.46.1`. **Gemma 4 needs `transformers>=5.5`**
-(its config declares `transformers_version: 5.5.0.dev0`). Those cannot coexist in
-one process, so `01a_generate_text` (transformers 5.x + Gemma 4) and
-`01b_synthesize_audio` (4.46.1 + parler-tts) are separate Kaggle sessions with the
-Hub as the checkpoint between them.
-
-`LlamaCppBackend` exists for local smoke tests on small GGUF models; an 8B does
-not fit the 4GB laptop card.
+`parler-tts` hard-pins `transformers==4.46.1`. The LLM stage needs neither that
+pin nor even transformers (llama.cpp uses the GGUF's own chat template), so
+`01a_generate_text` and `01b_synthesize_audio` (4.46.1 + parler-tts) are separate
+Kaggle sessions with the Hub as the checkpoint between them.
 """
 
 from __future__ import annotations
 
 import abc
+import re
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -39,6 +42,7 @@ __all__ = [
     "LlamaCppBackend",
     "EchoBackend",
     "build_backend",
+    "strip_thinking",
 ]
 
 
@@ -158,6 +162,50 @@ def _oom_message(model_id: str, original: str) -> str:
         "    --model google/gemma-4-E2B-it",
     ]
     return "\n".join(lines)
+
+
+# Reasoning models wrap their scratch-work in one of a few conventions. We strip
+# it defensively no matter which the model uses, so it never reaches the parser
+# (and never gets voiced by the TTS downstream). Order matters: block forms first,
+# then a "final channel" cut, then stray control tokens.
+_THINK_BLOCK = re.compile(
+    r"<(think|thinking|reason(?:ing)?)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL
+)
+# Harmony / channel style: keep only what follows the LAST `final`/`answer` channel.
+_FINAL_CHANNEL = re.compile(
+    r".*<\|?channel\|?>\s*(?:final|answer)\b.*?(?:<\|?message\|?>)?", re.IGNORECASE | re.DOTALL
+)
+# A bare opening think token with no close: drop everything up to the first blank
+# line or the next turn marker.
+_OPEN_THINK = re.compile(
+    r"^\s*<\|?/?think\|?>\s*", re.IGNORECASE
+)
+# Leftover special tokens from any template.
+_SPECIALS = re.compile(
+    r"<\|[^>]*\|>|</?s>|<(?:end|start)_of_turn>|<pad>", re.IGNORECASE
+)
+
+
+def strip_thinking(text: str) -> str:
+    """Remove reasoning scratch-work from a completion, keeping the final answer.
+
+    Handles `<think>...</think>` blocks, harmony-style `<|channel|>final` cuts, a
+    dangling open think token, and stray special tokens. Idempotent and safe on
+    text that contains none of these.
+    """
+    if not text:
+        return text
+    prev = None
+    s = text
+    while s != prev:
+        prev = s
+        s = _THINK_BLOCK.sub("", s)
+    m = _FINAL_CHANNEL.match(s)
+    if m:
+        s = s[m.end():]
+    s = _OPEN_THINK.sub("", s)
+    s = _SPECIALS.sub("", s)
+    return s.strip()
 
 
 def _merge_system_into_user(messages: list[dict]) -> list[dict]:
@@ -357,38 +405,97 @@ class TransformersBackend(LLMBackend):
 
 
 class LlamaCppBackend(LLMBackend):
-    """GGUF via llama-cpp-python. Single-stream; for local smoke tests only."""
+    """GGUF via llama-cpp-python, split across both T4s with `tensor_split`.
+
+    This is now the DEFAULT LLM path (config `backend: llamacpp`). It serves
+    `unsloth/gemma-4-26B-A4B-it-GGUF` -- a 25.2B / 3.8B-active MoE, far stronger
+    than the E4B dense model, at ~16 GB in Q4_K_M. That does not fit one T4, so
+    `tensor_split=[0.5, 0.5]` spreads the single model across both cards. There
+    is therefore ONE process and no cross-GPU sharding: both GPUs hold one model.
+
+    Generation is single-stream (llama.cpp chat completions are sequential), so
+    the whole run is slow -- disabling thinking is what keeps it feasible.
+    """
+
+    #: exact model + file from the reference notebook
+    DEFAULT_REPO = "unsloth/gemma-4-26B-A4B-it-GGUF"
+    DEFAULT_FILE = "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"
 
     def __init__(
         self,
-        model_id: str = "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
-        filename: str = "*Q4_K_M.gguf",
+        model_id: str | None = None,
+        filename: str | None = None,
         *,
         n_gpu_layers: int = -1,
         n_ctx: int = 4096,
+        tensor_split: list[float] | None = None,
+        top_k: int = 64,
+        disable_thinking: bool = True,
+        **_ignored,
     ):
         from llama_cpp import Llama
 
-        self.model_id = f"{model_id}:{filename}"
+        repo = model_id or self.DEFAULT_REPO
+        fname = filename or self.DEFAULT_FILE
+        self.model_id = f"{repo}:{fname}"
+        self.top_k = top_k
+        self.disable_thinking = disable_thinking
+        self._think_kwarg_ok: bool | None = None  # learned on first call
+
+        import torch
+
+        n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if tensor_split is None and n_gpu > 1:
+            tensor_split = [1.0 / n_gpu] * n_gpu  # even split across all GPUs
+
+        print(f"[llm] llama.cpp loading {repo}/{fname}")
+        print(f"[llm]   n_gpu_layers={n_gpu_layers}  tensor_split={tensor_split}  n_ctx={n_ctx}")
         self.llm = Llama.from_pretrained(
-            repo_id=model_id,
-            filename=filename,
+            repo_id=repo,
+            filename=fname,
             n_gpu_layers=n_gpu_layers,
+            tensor_split=tensor_split,
+            main_gpu=0,
             n_ctx=n_ctx,
             verbose=False,
         )
 
+    def _complete(self, conv: list[dict], sampling: Sampling, *, thinking_off: bool):
+        kw = dict(
+            messages=conv,
+            temperature=sampling.temperature,
+            top_p=sampling.top_p,
+            top_k=self.top_k,
+            max_tokens=sampling.max_new_tokens,
+            seed=sampling.seed,
+        )
+        if thinking_off:
+            # enable_thinking=False via chat_template_kwargs is an OPEN feature in
+            # llama-cpp-python (abetlen/llama-cpp-python#2063), so older builds
+            # raise TypeError. We try it, remember whether it took, and fall back
+            # to stripping the reasoning from the output.
+            kw["chat_template_kwargs"] = {"enable_thinking": False}
+        return self.llm.create_chat_completion(**kw)
+
     def _generate(self, convs: list[list[dict]], sampling: Sampling) -> list[str]:
         outs = []
         for conv in convs:
-            r = self.llm.create_chat_completion(
-                messages=conv,
-                temperature=sampling.temperature,
-                top_p=sampling.top_p,
-                max_tokens=sampling.max_new_tokens,
-                seed=sampling.seed,
-            )
-            outs.append(r["choices"][0]["message"]["content"] or "")
+            if self.disable_thinking and self._think_kwarg_ok is None:
+                # Probe once: does this llama-cpp-python accept the kwarg?
+                try:
+                    r = self._complete(conv, sampling, thinking_off=True)
+                    self._think_kwarg_ok = True
+                    print("[llm] enable_thinking=False accepted by chat template")
+                except (TypeError, ValueError) as e:
+                    self._think_kwarg_ok = False
+                    print(f"[llm] chat_template_kwargs unsupported ({type(e).__name__}); "
+                          f"stripping reasoning from output instead")
+                    r = self._complete(conv, sampling, thinking_off=False)
+            else:
+                r = self._complete(conv, sampling,
+                                   thinking_off=self.disable_thinking and bool(self._think_kwarg_ok))
+            content = r["choices"][0]["message"].get("content") or ""
+            outs.append(strip_thinking(content) if self.disable_thinking else content)
         return outs
 
 
@@ -409,8 +516,14 @@ class EchoBackend(LLMBackend):
 
 
 def build_backend(name: str, **kw) -> LLMBackend:
+    """Route kwargs to the selected backend, dropping ones it doesn't take.
+
+    The CLIs pass a superset (model_id, filename, ...); `filename` is meaningful
+    only to llama.cpp, so we strip it for the others rather than crash them.
+    """
     match name:
         case "transformers":
+            kw.pop("filename", None)
             return TransformersBackend(**kw)
         case "llamacpp":
             return LlamaCppBackend(**kw)

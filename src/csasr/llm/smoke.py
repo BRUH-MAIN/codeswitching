@@ -38,8 +38,10 @@ FALLBACK_EXAMPLES = [
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--model", default="google/gemma-4-E4B-it")
-    ap.add_argument("--backend", default="transformers")
+    ap.add_argument("--model", default="unsloth/gemma-4-26B-A4B-it-GGUF")
+    ap.add_argument("--gguf-file", default="gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
+                    help="llama.cpp only: GGUF filename in the --model repo")
+    ap.add_argument("--backend", default="llamacpp")
     ap.add_argument("--train-manifest", default=None,
                     help="sample few-shot exemplars from here instead of the canned ones")
     ap.add_argument("--n-calls", type=int, default=2)
@@ -59,7 +61,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[smoke] model  : {args.model}")
     print(f"[smoke] prompts: {args.n_calls} x {args.bigrams_per_call} bigrams\n")
 
-    backend = build_backend(args.backend, model_id=args.model)
+    backend = build_backend(args.backend, model_id=args.model, filename=args.gguf_file)
     convs = [bigram_messages(examples, n=args.bigrams_per_call) for _ in range(args.n_calls)]
     responses = backend.chat(
         convs,
@@ -68,8 +70,16 @@ def main(argv: list[str] | None = None) -> int:
         desc="smoke",
     )
 
-    print("\n--- raw completion (first call) ---")
+    print("\n--- completion, first call (after any thinking-strip) ---")
     print(responses[0][:500])
+
+    # If the model kept thinking despite disable, the markers survive here.
+    leaked = [t for t in ("<think", "<|channel", "<|think", "</think")
+              if any(t in r for r in responses)]
+    if leaked:
+        print(f"\n[smoke] WARNING: reasoning markers still present {leaked} -- "
+              f"disable-thinking did not fully work. Tell the maintainer; "
+              f"strip_thinking may need another pattern.")
 
     phrases = [p for r in responses for p in parse_bigrams(r)]
     kept, dropped, extracted = [], [], 0

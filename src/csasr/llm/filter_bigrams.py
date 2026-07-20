@@ -87,8 +87,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--raw", type=Path, required=True, help="bigrams_raw.jsonl")
     ap.add_argument("--out", type=Path, required=True, help="bigrams_valid.jsonl")
     ap.add_argument("--cache", type=Path, default=Path("data/llm_cache/transcheck.jsonl"))
-    ap.add_argument("--backend", default="transformers")
-    ap.add_argument("--model", default="google/gemma-4-E4B-it")
+    ap.add_argument("--backend", default="llamacpp")
+    ap.add_argument("--model", default="unsloth/gemma-4-26B-A4B-it-GGUF")
+    ap.add_argument("--gguf-file", default="gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
+                    help="llama.cpp only: GGUF filename in the --model repo")
     ap.add_argument("--items-per-call", type=int, default=20)
     ap.add_argument("--n-samples", type=int, default=3, help="self-consistency votes")
     ap.add_argument("--batch-size", type=int, default=8)
@@ -143,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.skip_translation_check and pairs:
         chunks = [pairs[i : i + args.items_per_call] for i in range(0, len(pairs), args.items_per_call)]
         convs = [translation_check_messages([(hi, en) for _, hi, en in ch]) for ch in chunks]
-        backend = build_backend(args.backend, model_id=args.model)
+        backend = build_backend(args.backend, model_id=args.model, filename=args.gguf_file)
         sampling = Sampling(temperature=args.temperature, max_new_tokens=8 * args.items_per_call, seed=args.seed)
 
         votes: dict[str, Counter] = {bg: Counter() for bg, _, _ in pairs}
