@@ -68,19 +68,32 @@ parler-tts; the LLM stage here needs neither that pin nor transformers at all (l
 uses the GGUF's own chat template). The Hub is the checkpoint between them.
 
 ### The model: `unsloth/gemma-4-26B-A4B-it-GGUF`
-* **apache-2.0, ungated.** A 25.2B-total / **3.8B-active** MoE — far stronger than the dense
-  E4B used earlier, which produced text that was too English-heavy and switched too little
-  (deviation D11). This should fix that.
-* Served by **llama.cpp** (`backend: llamacpp`), Q4_K_M ≈ 16 GB. That does **not** fit one
-  T4, so `tensor_split=[0.5, 0.5]` spreads the single model across **both** cards.
-* **Consequences, stated plainly:**
-  - *One process, both GPUs.* No cross-GPU sharding here — both T4s hold the one model. The
-    per-GPU sharding used for the dense E4B does not apply.
-  - *Single-stream and slow.* llama.cpp chat completions are sequential, so the full run is
-    ~8–12 h. Every call is cached, so a 12 h session cap is survived by re-running.
-  - *Thinking is disabled* (`disable_thinking: true`) — reasoning tokens would multiply the
-    runtime. The backend tries `enable_thinking=False` and strips any reasoning that leaks;
-    the smoke test flags it if thinking survives.
+* **apache-2.0, ungated.** A 25.2B-total / **3.8B-active** MoE, served by **llama.cpp**
+  (`backend: llamacpp`). Q4_K_M ≈ 16 GB does **not** fit one T4, so `tensor_split=[0.5, 0.5]`
+  spreads the single model across **both** cards.
+* *One process, both GPUs.* No cross-GPU sharding here — both T4s hold the one model.
+* *Thinking is disabled* (`disable_thinking: true`). The backend tries `enable_thinking=False`
+  and strips any reasoning that leaks; the smoke test flags it if thinking survives.
+* **Measured** (4,466 calls): ~2 h 26 m wall clock at ~1.1 req/s — much faster than feared,
+  because only 3.8B params are active per token.
+
+### What switching to this model did and did NOT fix
+Measured against the real MUCS corpus, versus the dense Gemma-4-E4B it replaced:
+
+| | E4B | **26B-A4B** | real MUCS |
+|---|---|---|---|
+| %Latin | 46.9% | **47.2%** | **25.1%** |
+| switch points/sentence | 1.96 | **2.02** | **3.15** |
+| filter survival | 37.7% | **85.2%** | 92.3% (paper) |
+| unique bigrams | 25,348 | **3,458** | 5,932 (paper) |
+| median sentence | 8 words | **12 words** | — |
+
+* **Fixed:** sentence quality. Far more fluent, and filter survival more than doubled to near
+  the paper's 92.3%.
+* **NOT fixed:** deviation **D11**. The script mix and switch density barely moved — that gap
+  appears to come from the *prompt*, not model capacity.
+* **New problem:** this model repeats itself, yielding only 3,458 unique bigrams. Hence
+  `--n-calls 15000` below rather than the paper's 4,466.
 
 ### Before you run
 * HF **write** token in Kaggle Secrets as `HF_TOKEN`. Internet **on**, **GPU T4 ×2**.
@@ -96,7 +109,7 @@ Every LLM call is cached, so a 12 h timeout costs nothing on a re-run.
 !pip install -q "datasets<4" librosa soundfile soxr omegaconf rich huggingface_hub
 !pip install -q --force-reinstall --no-deps git+{REPO}
 
-NOTEBOOK_VERSION = "0.10.0"
+NOTEBOOK_VERSION = "0.10.1"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -198,7 +211,7 @@ gen("csasr.llm.gen_bigrams",
     "--train-manifest", MAN / "mucs_train.jsonl",
     "--out", MAN / "bigrams_raw.jsonl",
     "--cache", CACHE / "bigrams.jsonl",
-    "--n-calls", "4466")
+    "--n-calls", "15000")
 """),
 
     md("## 4 · Filter\n\nDeterministic script filter (one Devanagari token + one Latin token), then an LLM translation check with 3-sample self-consistency.\nPaper: 5,932 unique → 5,477 valid (92.3%)."),
@@ -238,7 +251,14 @@ for name, got, want, surv in rows:
 print("\\npaper survival: dedup 13.3%, filter 92.3%")
 print("\\nGemma 4 26B-A4B is smaller than the paper's 70B (deviation D1), so a lower")
 print("valid-bigram yield is expected. What matters is that ENOUGH sentences survive:")
-print(f"  -> {len(sents):,} sentences  (need >~8,000 for a usable 22h corpus)")
+print(f"  -> {len(sents):,} sentences")
+print()
+est_h = sum(len(r["text"].split()) for r in sents) / 2.4 / 3600
+print(f"  projected TTS audio: ~{est_h:.1f} h   (Train_T1 needs 8 h; paper's Train_T2 = 22 h)")
+if est_h < 16:
+    print("  WARNING: M7 (Train_T2) would train on far less audio than the paper's 22 h,")
+    print("           which weakens the M6 -> M7 contrast. Raise --n-calls and re-run;")
+    print("           cached calls are free, so only the new ones cost time.")
 
 for r in sents[:5]:
     print("   ", r["text"])
@@ -309,7 +329,7 @@ costs at most the in-flight shard.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.10.0"
+NOTEBOOK_VERSION = "0.10.1"
 
 import csasr, transformers
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -524,7 +544,7 @@ what we test is the **M6 → M7 → M8 ordering**.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.10.0"
+NOTEBOOK_VERSION = "0.10.1"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -659,7 +679,7 @@ regrouped into its 30 recordings here — no re-upload.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.10.0"
+NOTEBOOK_VERSION = "0.10.1"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (
