@@ -7,7 +7,7 @@ name = "csasr"
 # Bump on every change that Kaggle must pick up. `pip install git+...` treats an
 # already-installed version as satisfied and SKIPS the reinstall, so a stale
 # session silently runs old code. The notebooks also --force-reinstall.
-version = "0.10.1"
+version = "0.10.2"
 description = "Replication of Track 2 of Biswas et al. (Interspeech 2025): Hindi-English code-switched ASR via LLM-synthesised data"
 requires-python = ">=3.10"
 dependencies = [

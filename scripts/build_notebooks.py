@@ -92,8 +92,18 @@ Measured against the real MUCS corpus, versus the dense Gemma-4-E4B it replaced:
   the paper's 92.3%.
 * **NOT fixed:** deviation **D11**. The script mix and switch density barely moved — that gap
   appears to come from the *prompt*, not model capacity.
-* **New problem:** this model repeats itself, yielding only 3,458 unique bigrams. Hence
-  `--n-calls 15000` below rather than the paper's 4,466.
+* **New problem, since resolved:** at the paper's 4,466 calls this model repeats itself,
+  yielding only 3,458 unique bigrams and just 12.5 h of audio. Hence `--n-calls 15000`
+  below. **Measured at 15,000 calls** — every figure now exceeds the paper:
+
+| | ours | paper |
+|---|---|---|
+| unique bigrams | **7,219** | 5,932 |
+| valid bigrams | **6,114** | 5,477 |
+| sentences | **18,054** | 16,000 |
+| projected audio | **~25.1 h** | 22 h |
+
+  Cost: ~6 h 26 m from a cold cache (3h45 bigrams + 36m filter + 2h05 sentences).
 
 ### Before you run
 * HF **write** token in Kaggle Secrets as `HF_TOKEN`. Internet **on**, **GPU T4 ×2**.
@@ -109,7 +119,7 @@ Every LLM call is cached, so a 12 h timeout costs nothing on a re-run.
 !pip install -q "datasets<4" librosa soundfile soxr omegaconf rich huggingface_hub
 !pip install -q --force-reinstall --no-deps git+{REPO}
 
-NOTEBOOK_VERSION = "0.10.1"
+NOTEBOOK_VERSION = "0.10.2"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -329,7 +339,7 @@ costs at most the in-flight shard.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.10.1"
+NOTEBOOK_VERSION = "0.10.2"
 
 import csasr, transformers
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -544,7 +554,7 @@ what we test is the **M6 → M7 → M8 ordering**.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.10.1"
+NOTEBOOK_VERSION = "0.10.2"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -679,7 +689,7 @@ regrouped into its 30 recordings here — no re-upload.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.10.1"
+NOTEBOOK_VERSION = "0.10.2"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (
