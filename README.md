@@ -63,8 +63,9 @@ Each is cheap relative to what it protects. **Run them in this order.**
 |---|---|---|
 | **0** | `verify_table1.py` reproduces the paper's Table 1 word and bigram counts | CPU, seconds |
 | **1** | Bigram yield ratios track the paper (13.3% dedup, 92.3% filter) | free (end of Stage 1) |
-| **2** | `Train_T1 ⊆ Train_T2`; durations ≈ 8h / 22h; spot-listen | free (end of Stage 2) |
 | **1.5** | `audit_sentences.py` — label leaks, script mix, switch density, domain overlap, projected TTS hours | CPU, seconds |
+| **2** | `Train_T1 ⊆ Train_T2`; durations ≈ 8h / 22h; **spot-listen** | free (end of Stage 2) |
+| **2b** | `verify_gate2.py` — the T1 ids resolve against the **published** parquet | seconds (`--t2/--t1`) |
 | **3** | `whisper-large-v2` zero-shot ≈ **52.0 MER / 42.9 CBA-HE** | ~15 min on a T4 |
 
 Gate 3 is inference-only and validates decoding, normalization, language ID, and
@@ -227,6 +228,37 @@ exemplar text and a 4h dev slice**, neither of which depends on its exact word c
 Gate 0 therefore asserts the paper's counts on `test` and only integrity invariants
 (duration, both languages present, no surviving `MIXED` tokens, code-switching present)
 on `train`.
+
+---
+
+### Gate 2 status: automated checks PASSED
+
+18,054 sentences → **18,010 clips / 23.95 h**, 44 dropped (0.24%) by the
+0.5–30 s filter that catches TTS collapse. Runtime ~2h25m: four shards, two at a
+time, one per T4.
+
+```
+Train_T2   18,010 clips   23.95 h   5,387 bigrams        (paper: ~16,000 / 22 h)
+Train_T1    6,069 clips    8.00 h   5,387 bigrams        100% bigram coverage
+round-trip 18,010 rows    23.95 h   16000 Hz             OK
+Gate 2b     6,069 T1 ids resolve against the published parquet, 0 missing
+```
+
+Two numbers needed chasing:
+
+* **23.95 h, not the 25.1 h Gate 1.5 projected.** The projection overestimates
+  per-clip duration by ~4.6%. Harmless — actual still exceeds the paper's 22 h.
+* **5,387 distinct bigrams in T2, but Gate 1 validated 6,114.** Traced to sentence
+  generation, not TTS: `sentences.jsonl` already held only 5,387, so **727 valid
+  bigrams (11.9%) produced zero usable sentences** — the paper's own note that the
+  LLM often returns fewer than four, taken to its limit. Per-bigram yield is 3,569
+  with all four sentences, 302 with three, 1,352 with two, 163 with one. Our
+  *effective* bigram count, 5,387, lands within **1.6%** of the paper's 5,477.
+
+The remaining Gate 2 criterion — **spot-listening the clips** — cannot be
+automated, and [D14](#deviations-from-the-paper) makes it matter more than usual:
+Parler-TTS fed syntactically odd text is exactly where prosody collapses in a way
+no duration filter catches.
 
 ---
 
