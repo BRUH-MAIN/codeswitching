@@ -34,5 +34,5 @@ precision: auto
 tf32: auto
 gradient_checkpointing: auto
 attn_impl: auto
-num_proc: 8
-dataloader_workers: 8
+num_proc: 2
+dataloader_workers: 2

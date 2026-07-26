@@ -226,6 +226,12 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="auto = sdpa on CUDA, falling back to eager if unsupported")
     ap.add_argument("--optim", default="adamw_torch",
                     help="adamw_bnb_8bit cuts Adam state 12.3 GB -> ~3 GB on a 40 GB card")
+    # Disk, not VRAM. See save_only_model below: a large-v2 checkpoint is 6.2 GB
+    # of weights, or 18.5 GB if the optimizer state rides along.
+    ap.add_argument("--save-total-limit", type=int, default=2)
+    ap.add_argument("--save-optimizer", action="store_true",
+                    help="keep AdamW state in checkpoints so training can resume; "
+                         "triples checkpoint size (18.5 GB each for large-v2)")
     return ap
 
 
@@ -272,13 +278,18 @@ def main(argv: list[str] | None = None) -> int:
     attn = args.attn_impl
     if attn == "auto":
         attn = "sdpa" if torch.cuda.is_available() else "eager"
+    # low_cpu_mem_usage loads shard-by-shard into the final placement instead of
+    # materialising a second full fp32 copy in host RAM. large-v2 is 6.2 GB, so
+    # on a 16 GB SLURM allocation the naive path is a real OOM risk.
     try:
         model = WhisperForConditionalGeneration.from_pretrained(
-            args.model, attn_implementation=attn
+            args.model, attn_implementation=attn, low_cpu_mem_usage=True
         )
     except (TypeError, ValueError) as e:
         print(f"[train] attn_implementation={attn!r} rejected ({e}); using the default")
-        model = WhisperForConditionalGeneration.from_pretrained(args.model)
+        model = WhisperForConditionalGeneration.from_pretrained(
+            args.model, low_cpu_mem_usage=True
+        )
         attn = "default"
     print(f"[train] attention {attn}")
 
@@ -357,7 +368,14 @@ def main(argv: list[str] | None = None) -> int:
         eval_strategy="steps",
         eval_steps=args.eval_steps,
         save_steps=args.eval_steps,
-        save_total_limit=2,
+        save_total_limit=args.save_total_limit,
+        # A Trainer checkpoint normally carries the AdamW state too -- 2 bytes of
+        # moment per byte of parameter. For large-v2 that is 6.2 GB of weights
+        # PLUS 12.3 GB of optimizer per checkpoint, so save_total_limit=2 quietly
+        # needs ~37 GB of disk. We never resume mid-run (we early-stop), and
+        # load_best_model_at_end only needs weights, so drop the optimizer:
+        # 37 GB -> 12.4 GB. Set --save-optimizer if you actually need to resume.
+        save_only_model=not args.save_optimizer,
         logging_steps=25,
         predict_with_generate=True,
         generation_max_length=225,

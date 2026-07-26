@@ -12,17 +12,23 @@
 # here the paper's own model is the baseline, so that extra decode is gone.
 #
 #SBATCH --job-name=csasr-eval
-#SBATCH --gres=gpu:a100:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --time=04:00:00
+#SBATCH --partition=workq
+#SBATCH --time=24:00:00
+#SBATCH --gres=gpu:1
+#SBATCH --nodelist=asaicomputenode02
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
 #SBATCH --output=slurm-eval-%j.out
 
 set -euo pipefail
 
-: "${HF_HOME:=/scratch/$USER/hf}"
-: "${OUT_ROOT:=/scratch/$USER/csasr/exp}"
-: "${RESULTS:=results}"
+PY=${PYTHON:-python3}
+
+# Must match what train_a100.sh used, or the checkpoints will not be found.
+: "${WORKDIR:=${SLURM_SUBMIT_DIR:-$PWD}/csasr-work}"
+: "${HF_HOME:=$WORKDIR/hf}"
+: "${OUT_ROOT:=$WORKDIR/exp}"
+: "${RESULTS:=${SLURM_SUBMIT_DIR:-$PWD}/results}"
 : "${MODELS:=m6 m7 m8}"
 : "${ZERO_SHOT:=1}"
 export HF_HOME
@@ -48,7 +54,7 @@ decode () {
     local model=$1 tag=$2
     echo ""
     echo "---- decode $tag ($model) ----"
-    python -m csasr.eval.decode \
+    $PY -m csasr.eval.decode \
         --model "$model" \
         --test-hf "$REAL" --test-config test \
         --out "$RESULTS/hyp_${tag}.jsonl" \
@@ -63,7 +69,7 @@ decode () {
 score () {
     local tag=$1
     for cba in adjacent lenient; do
-        python -m csasr.eval.score \
+        $PY -m csasr.eval.score \
             --refs "$REFS" --hyps "$RESULTS/hyp_${tag}.jsonl" \
             --mer-mode hybrid --group recording --cba-mode "$cba" \
             --name "${tag}-large-v2-cba_${cba}" --out "$TABLE"
@@ -88,7 +94,7 @@ done
 echo ""
 echo "== done $(date) =="
 echo "Table 2 rows -> $TABLE"
-python - <<PY
+$PY - <<PY
 import json, pathlib
 p = pathlib.Path("$TABLE")
 if not p.exists():

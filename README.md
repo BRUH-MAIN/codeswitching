@@ -29,7 +29,8 @@ comparable to the table above, not merely the M6 → M7 → M8 ordering.
 | model | whisper-small (244M) — **D2** | **whisper-large-v2 (1.54B) — no D2** |
 | precision | fp16 + GradScaler (no bf16 on Turing) | **bf16** (no scaler, cannot overflow) + **TF32** |
 | grad checkpointing | always on (16 GB) | auto: on at 40 GB, off at 80 GB |
-| how you launch it | `notebooks/02_train.ipynb` | [`scripts/train_a100.sh`](scripts/train_a100.sh) → [`scripts/eval_a100.sh`](scripts/eval_a100.sh) |
+| how you launch it | `notebooks/02_train.ipynb` | [`preflight_cluster.sh`](scripts/preflight_cluster.sh) → [`train_a100.sh`](scripts/train_a100.sh) → [`eval_a100.sh`](scripts/eval_a100.sh) |
+| checkpoint size | 1 GB each | 6.2 GB — AdamW state dropped via `save_only_model`, else 18.5 GB |
 | baseline row | needs a separate whisper-small zero-shot decode | **Gate 3 already is it** (51.9 measured vs 52.0) |
 
 Stages 1 and 2 (LLM text, TTS audio) are **finished and unchanged** — they stay on
@@ -40,11 +41,26 @@ were always real CLIs, so no notebook is involved.
 
 ```bash
 export HF_TOKEN=$(cat ~/.hf_token)
-export HF_HOME=/scratch/$USER/hf          # NOT your home quota: 17-35 GB of cache
-python scripts/prefetch_hub.py            # only if compute nodes lack internet
-MODELS="m6 m7" bash scripts/train_a100.sh # m8 needs cv_en on the Hub first
-bash scripts/eval_a100.sh
+
+sbatch scripts/preflight_cluster.sh       # ~1 min. DO THIS FIRST.
+cat slurm-preflight-*.out                 # GPU model? >=60 GB free? hub reachable?
+
+python3 scripts/prefetch_hub.py           # login node only, if compute has no net
+MODELS="m6 m7" sbatch scripts/train_a100.sh   # m8 needs cv_en on the Hub first
+WORKDIR=... sbatch scripts/eval_a100.sh
 ```
+
+**Run the preflight first.** `--gres=gpu:1` does not say *which* card you get, and
+whisper-large-v2 full fine-tuning needs ~24.7 GB of VRAM for optimizer state
+alone. The preflight prints the GPU model, free disk on every candidate
+filesystem, and whether the compute node can reach the Hub — then tells you
+whether large-v2 fits, needs `--optim adamw_bnb_8bit`, or requires falling back
+to `main`'s whisper-small configs.
+
+Budget **~60 GB** of disk: ~5 GB parquet, ~6 GB weights, 5.8/17.3/35.5 GB of
+featurized Arrow for M6/M7/M8, ~12 GB of checkpoints. `WORKDIR` defaults to
+`$SLURM_SUBMIT_DIR/csasr-work` and the job aborts up front if the filesystem is
+too small, rather than dying 40 minutes in.
 
 Precision, TF32 and gradient checkpointing are **detected**, not assumed — see
 `_plan_hardware` in [train_whisper.py](src/csasr/train/train_whisper.py), whose

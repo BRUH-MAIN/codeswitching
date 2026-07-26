@@ -1,33 +1,53 @@
 #!/usr/bin/env bash
-# Train M6 / M7 / M8 on a single A100. No notebook involved -- csasr.train is a
-# real CLI, which is the payoff of having kept the Kaggle notebooks thin.
+# Train M6 / M7 / M8 on one GPU. No notebook involved -- csasr.train is a real
+# CLI, which is the payoff of having kept the Kaggle notebooks thin.
 #
-#   sbatch scripts/train_a100.sh            # as a SLURM job
-#   bash   scripts/train_a100.sh            # interactively on a GPU node
-#   MODELS="m6 m7" bash scripts/train_a100.sh
+#   sbatch scripts/preflight_cluster.sh     # DO THIS FIRST (~1 min)
+#   sbatch scripts/train_a100.sh
+#   MODELS="m6 m7" sbatch scripts/train_a100.sh
 #
-# Precision, TF32 and gradient checkpointing are auto-detected from the card;
-# see _plan_hardware in src/csasr/train/train_whisper.py. Nothing here hardcodes
-# 40 GB vs 80 GB.
-#
+# SBATCH header follows the site template. `--gres=gpu:1` does not say WHICH
+# card you get, so nothing below assumes an A100: precision, TF32 and gradient
+# checkpointing are all detected at runtime by _plan_hardware() in
+# src/csasr/train/train_whisper.py.
+
 #SBATCH --job-name=csasr-t2
-#SBATCH --gres=gpu:a100:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --time=12:00:00
-#SBATCH --output=slurm-%j.out
+#SBATCH --partition=workq
+#SBATCH --time=24:00:00
+#SBATCH --gres=gpu:1
+#SBATCH --nodelist=asaicomputenode02
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --output=slurm-train-%j.out
 
 set -euo pipefail
 
-# ---- environment ----------------------------------------------------------
-# HF_HOME must NOT be a home directory. The featurized Arrow cache is 0.96 MB
-# per clip: ~5.8 GB for M6, ~17.3 GB for M7, ~35.5 GB for M8. Home quotas are
-# typically 10-50 GB and the failure arrives an hour into the job.
-: "${HF_HOME:=/scratch/$USER/hf}"
-: "${OUT_ROOT:=/scratch/$USER/csasr/exp}"
+PY=${PYTHON:-python3}          # the site template calls python3, not python
+
+# ---- where the big files go ------------------------------------------------
+# This needs ~60 GB and it must NOT be a quota'd home directory:
+#   parquet download   ~5 GB
+#   model weights      ~6 GB
+#   featurized Arrow   5.8 GB (M6) / 17.3 GB (M7) / 35.5 GB (M8)
+#   checkpoints        ~12 GB   (6.2 GB each x save_total_limit 2; the AdamW
+#                                state is dropped -- see save_only_model)
+# Override WORKDIR if preflight showed a better filesystem.
+: "${WORKDIR:=${SLURM_SUBMIT_DIR:-$PWD}/csasr-work}"
+: "${HF_HOME:=$WORKDIR/hf}"
+: "${OUT_ROOT:=$WORKDIR/exp}"
 : "${MODELS:=m6 m7 m8}"
 export HF_HOME
 mkdir -p "$HF_HOME" "$OUT_ROOT"
+
+# Fail now, not 40 minutes in, if the filesystem cannot hold the run.
+avail_gb=$(df -BG --output=avail "$WORKDIR" | tail -1 | tr -dc '0-9')
+echo "[disk] $WORKDIR has ${avail_gb} GB free"
+if (( avail_gb < 60 )); then
+    echo "!! Only ${avail_gb} GB free; M7 needs ~40 GB and M8 ~60 GB." >&2
+    echo "   Set WORKDIR to a bigger filesystem (preflight lists candidates)," >&2
+    echo "   or run MODELS=\"m6\" first." >&2
+    (( avail_gb < 25 )) && exit 1     # below this even M6 cannot finish
+fi
 
 # Token from the environment, never from argv -- argv leaks into every traceback
 # and into `ps` output for every other user on the node.
@@ -37,13 +57,13 @@ if [[ -z "${HF_TOKEN:-}" ]]; then
     exit 1
 fi
 
-echo "== $(date) =="
+echo "== $(date) on $(hostname -s) =="
 nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv
-df -h "$HF_HOME" | tail -1
-python -c "import csasr; print('csasr', csasr.__version__)"
+echo "cpus=${SLURM_CPUS_PER_TASK:-$(nproc)}  mem=${SLURM_MEM_PER_NODE:-?}MB"
+$PY -c "import csasr; print('csasr', csasr.__version__)"
 
 # Train_T1 is a by-reference subset, so M6 needs the id list. Fetch it once.
-T1_IDS=$(python - <<'PY'
+T1_IDS=$($PY - <<'PY'
 import os
 from huggingface_hub import hf_hub_download
 print(hf_hub_download("RohanRamesh/hi-en-synth-cs", "t1_ids.json",
@@ -69,10 +89,11 @@ run_model () {
     date
     # Only the cache-*.arrow files go; the parquet download is the expensive part.
     free_map_cache
-    python -m csasr.train.train_whisper \
+    $PY -m csasr.train.train_whisper \
         --config "configs/train_${m}_large.yaml" \
         --out "$OUT_ROOT/${m}_large" \
         "$@"
+    df -h "$WORKDIR" | tail -1
 }
 
 for m in $MODELS; do
@@ -93,7 +114,7 @@ done
 if [[ "${PUSH:-0}" == "1" ]]; then
     for m in $MODELS; do
         [[ -d "$OUT_ROOT/${m}_large" ]] || continue
-        python - "$m" "$OUT_ROOT/${m}_large" <<'PY'
+        $PY - "$m" "$OUT_ROOT/${m}_large" <<'PY'
 import os, sys
 from huggingface_hub import HfApi
 m, folder = sys.argv[1], sys.argv[2]
@@ -110,4 +131,4 @@ echo ""
 echo "== done $(date) =="
 ls -la "$OUT_ROOT"
 echo ""
-echo "next: bash scripts/eval_a100.sh"
+echo "next: WORKDIR=$WORKDIR sbatch scripts/eval_a100.sh"

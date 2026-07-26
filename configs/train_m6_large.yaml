@@ -44,5 +44,5 @@ precision: auto
 tf32: auto
 gradient_checkpointing: auto
 attn_impl: auto
-num_proc: 8                      # safe again since TOKENIZERS_PARALLELISM=false
-dataloader_workers: 8
+num_proc: 2                      # SLURM gives 4 CPUs; leave room for the main proc
+dataloader_workers: 2
