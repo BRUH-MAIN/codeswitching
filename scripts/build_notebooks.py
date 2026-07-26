@@ -11,10 +11,18 @@ notebook cells, where it cannot be reviewed or tested.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 REPO = "https://github.com/BRUH-MAIN/codeswitching.git"
-OUT = Path(__file__).resolve().parents[1] / "notebooks"
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / "notebooks"
+
+# Read the version rather than hardcoding it in four places. The notebooks assert
+# csasr.__version__ == NOTEBOOK_VERSION, so a hardcoded copy that drifts behind a
+# version bump makes every notebook fail its own preflight for no reason.
+sys.path.insert(0, str(ROOT / "src"))
+from csasr import __version__ as VERSION  # noqa: E402
 
 
 def md(text: str) -> dict:
@@ -119,7 +127,7 @@ Every LLM call is cached, so a 12 h timeout costs nothing on a re-run.
 !pip install -q "datasets<4" librosa soundfile soxr omegaconf rich huggingface_hub
 !pip install -q --force-reinstall --no-deps git+{REPO}
 
-NOTEBOOK_VERSION = "0.10.2"
+NOTEBOOK_VERSION = "{VERSION}"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -339,7 +347,7 @@ costs at most the in-flight shard.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.10.2"
+NOTEBOOK_VERSION = "{VERSION}"
 
 import csasr, transformers
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -540,6 +548,21 @@ AdamW, lr 2e-5, effective batch 64.
 
 Deviation D2: the paper used whisper-large-v2 (1.54B). Absolute MER will be far worse;
 what we test is the **M6 → M7 → M8 ordering**.
+
+### Two things that used to break this notebook
+
+**Featurization used to hang forever.** `datasets.map(num_proc=2)` forks after the
+parent has already used the Rust fast tokenizer, and the child inherits its thread
+pool and deadlocks — the bar sits at `0/N` with **zero CPU**, which looks like "slow"
+but never finishes. Fixed in `csasr>=0.10.3`: `TOKENIZERS_PARALLELISM=false` is set at
+import time and `--num-proc` now defaults to **1**. Featurization is numpy log-mel plus
+a FLAC decode, so one worker costs only a few minutes across the whole corpus.
+
+**The featurized cache fills the disk.** One whisper-small log-mel is
+80 × 3000 float32 = **0.96 MB per clip** — ~5.8 GB for M6, ~17.3 GB for M7, ~35.5 GB
+for M8. Left to accumulate that is ~61 GB and M8 dies with *No space left on device*
+partway through. `free_map_cache()` runs before M7 and M8 and deletes only the
+`cache-*.arrow` files, keeping the expensive parquet download.
 """),
 
     code(f"""
@@ -554,7 +577,7 @@ what we test is the **M6 → M7 → M8 ordering**.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.10.2"
+NOTEBOOK_VERSION = "{VERSION}"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (
@@ -584,8 +607,28 @@ def run(*args):
     print(">", " ".join(str(a) for a in args), flush=True)
     subprocess.run([sys.executable, "-m", *args], check=True)
 
+def free_map_cache():
+    \"\"\"Delete the featurized Arrow cache, keeping the downloaded parquet.
+
+    A whisper-small log-mel is 80 x 3000 float32 = 0.96 MB PER CLIP, so the
+    featurized cache is ~5.8 GB for M6, ~17.3 GB for M7 and ~35.5 GB for M8.
+    Left to accumulate that is ~61 GB and M8 dies with No space left on device
+    after an hour of work. The parquet download is the expensive part, so only
+    the cache-*.arrow files are removed.
+    \"\"\"
+    import glob
+    freed = 0
+    for f in glob.glob("/kaggle/temp/hf/**/cache-*.arrow", recursive=True):
+        try:
+            freed += os.path.getsize(f); os.remove(f)
+        except OSError:
+            pass
+    print(f"[cache] freed {{freed / 1e9:.1f}} GB of featurized Arrow")
+    !df -h /kaggle/temp | tail -1
+
 t1_ids = hf_hub_download(SYNTH, "t1_ids.json", repo_type="dataset", token=HF_TOKEN)
 !nvidia-smi --query-gpu=name,memory.total --format=csv
+!df -h /kaggle/temp | tail -1
 """),
 
     md("## Smoke test first\n\n20 steps on 1% of the data proves the collator, the `<|hi|>` prefix tokens, and the label masking work — before committing a 3h session."),
@@ -606,8 +649,9 @@ run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/m6"
     "--max-steps", "5000", "--eval-steps", "250", "--patience", "4")
 """),
 
-    md("## M7 — Train_T2 (22h synthetic)"),
+    md("## M7 — Train_T2 (22h synthetic)\n\nClear M6's featurized cache first — see `free_map_cache()` above for why."),
     code("""
+free_map_cache()
 run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/m7",
     "--train-hf", SYNTH, "--train-config", "synth_t2",
     "--dev-hf", REAL, "--dev-config", "dev",
@@ -615,8 +659,16 @@ run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/m7"
     "--max-steps", "5000", "--eval-steps", "250", "--patience", "4")
 """),
 
-    md("## M8 — Train_T2 + Common Voice monolingual (52h)\n\nStill one `<|hi|>` prompt for everything: language-*specific* prompting is Track 1's M4."),
+    md("""
+## M8 — Train_T2 + Common Voice monolingual (52h)
+
+Still one `<|hi|>` prompt for everything: language-*specific* prompting is Track 1's M4.
+
+**This is the run that fills the disk.** ~37,000 clips x 0.96 MB = **~35.5 GB** of
+featurized Arrow, so clearing M7's cache first is not optional.
+"""),
     code("""
+free_map_cache()
 run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/m8",
     "--train-hf", SYNTH, "--train-config", "synth_t2",
     "--extra-hf", f"{REAL}:cv_hi", f"{REAL}:cv_en",
@@ -689,7 +741,7 @@ regrouped into its 30 recordings here — no re-upload.
 
 # This NOTEBOOK's own version. `pip install` updates the csasr PACKAGE but NOT the
 # .ipynb -- an old notebook against a new package is a real and confusing failure.
-NOTEBOOK_VERSION = "0.10.2"
+NOTEBOOK_VERSION = "{VERSION}"
 
 import csasr
 assert csasr.__version__ == NOTEBOOK_VERSION, (

@@ -17,8 +17,17 @@ test set is scored under.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+# MUST precede any transformers/tokenizers import. `datasets.map(num_proc=N)`
+# forks, and the parent has already used the Rust fast tokenizer (via
+# set_prefix_tokens) and touched the CUDA driver. A forked child that inherits
+# the tokenizers thread pool deadlocks: the map bar sits at 0/N forever with
+# zero CPU, which reads like "slow" but never finishes. Setting this at import
+# time is the only placement that is guaranteed early enough.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 __all__ = ["main"]
 
@@ -71,12 +80,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--language", default="hi", help="training prompt language token")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--dataset-fraction", type=float, default=1.0)
-    ap.add_argument("--num-proc", type=int, default=2, help="datasets.map workers; use 1 on Windows")
+    # Default 1, deliberately. Featurization is numpy log-mel + FLAC decode, so
+    # 2 workers saves only a few minutes across the whole corpus -- not worth
+    # reintroducing the fork deadlock that TOKENIZERS_PARALLELISM above guards
+    # against. Raise it only if you have confirmed the map actually progresses.
+    ap.add_argument("--num-proc", type=int, default=1, help="datasets.map workers")
     ap.add_argument("--dataloader-workers", type=int, default=2)
     ap.add_argument("--report-to", default="auto", help="'auto' uses tensorboard if installed")
     args = ap.parse_args(argv)
-
-    import os
 
     import torch
     from transformers import (
