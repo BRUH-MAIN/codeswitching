@@ -7,7 +7,7 @@ name = "csasr"
 # Bump on every change that Kaggle must pick up. `pip install git+...` treats an
 # already-installed version as satisfied and SKIPS the reinstall, so a stale
 # session silently runs old code. The notebooks also --force-reinstall.
-version = "0.10.3"
+version = "0.11.0"
 description = "Replication of Track 2 of Biswas et al. (Interspeech 2025): Hindi-English code-switched ASR via LLM-synthesised data"
 requires-python = ">=3.10"
 dependencies = [
@@ -35,6 +35,10 @@ local = ["requests>=2.31", "soxr>=0.3"]
 llm = ["llama-cpp-python>=0.3.0"]
 tts = ["transformers==4.46.1", "parler-tts"]   # parler-tts hard-pins transformers; NEVER install with `train`
 train = ["transformers>=4.49", "accelerate>=1.1", "evaluate>=0.4", "tensorboard"]
+# Only needed for --optim adamw_bnb_8bit, which cuts Adam state from 12.3 GB to
+# ~3 GB and is the escape hatch if large-v2 will not fit a 40 GB A100. Kept out of
+# `train` because bitsandbytes has no useful CPU build and would break a bare venv.
+train8bit = ["bitsandbytes>=0.43"]
 # faster-whisper is the engine WhisperX wraps; ctranslate2 converts our
 # fine-tuned HF checkpoints into the format it loads.
 decode = ["faster-whisper>=1.0", "ctranslate2>=4.0"]

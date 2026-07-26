@@ -1,0 +1,47 @@
+# M8 on an A100: Train_T2 (23.95h synthetic) + Common Voice monolingual.
+# Paper: MER 39.2, CBA-HE 55.4, CBA-EH 56.x
+#
+# ~50h of audio total (D7: CV Hindi yields 11.87h, not 15h -- that is all that
+# exists in CV 17). Still a SINGLE <|hi|> prompt for everything: language-
+# specific prompting is Track 1's M4, not Track 2.
+#
+# Expected: ~4% relative MER improvement over M7.
+#
+# REQUIRES cv_en on the Hub. If it is missing this fails at load time, before any
+# GPU work -- run M6 and M7 first, they do not depend on it.
+#
+# BIGGEST DISK FOOTPRINT: ~37,000 clips x 0.96 MB = ~35.5 GB of featurized Arrow.
+# Clear the previous run's cache first (scripts/train_a100.sh does this).
+
+model: openai/whisper-large-v2
+out: exp/m8_large
+
+train_hf: RohanRamesh/hi-en-synth-cs
+train_config: synth_t2
+subset_ids: null
+
+extra_hf:
+  - RohanRamesh/mucs-he-cs:cv_hi
+  - RohanRamesh/mucs-he-cs:cv_en
+
+dev_hf: RohanRamesh/mucs-he-cs
+dev_config: dev
+
+language: hi
+
+lr: 2.0e-5
+batch_size: 16
+grad_accum: 4
+eval_batch_size: 8
+max_steps: 5000
+warmup_steps: 200
+eval_steps: 250
+patience: 4
+seed: 1234
+
+precision: auto
+tf32: auto
+gradient_checkpointing: auto
+attn_impl: auto
+num_proc: 8
+dataloader_workers: 8

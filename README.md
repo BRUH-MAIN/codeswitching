@@ -17,6 +17,43 @@ by a TTS model, is enough to adapt Whisper to a code-switching domain.
 
 ---
 
+## You are on the `ampere` branch
+
+This branch trains on a **single A100** with **`whisper-large-v2`** — the paper's
+own model — so **deviation D2 does not apply here** and absolute MER is directly
+comparable to the table above, not merely the M6 → M7 → M8 ordering.
+
+| | `main` | **`ampere`** (here) |
+|---|---|---|
+| training hardware | Kaggle 2× T4 (Turing, sm75) | one A100 (Ampere, sm80) |
+| model | whisper-small (244M) — **D2** | **whisper-large-v2 (1.54B) — no D2** |
+| precision | fp16 + GradScaler (no bf16 on Turing) | **bf16** (no scaler, cannot overflow) + **TF32** |
+| grad checkpointing | always on (16 GB) | auto: on at 40 GB, off at 80 GB |
+| how you launch it | `notebooks/02_train.ipynb` | [`scripts/train_a100.sh`](scripts/train_a100.sh) → [`scripts/eval_a100.sh`](scripts/eval_a100.sh) |
+| baseline row | needs a separate whisper-small zero-shot decode | **Gate 3 already is it** (51.9 measured vs 52.0) |
+
+Stages 1 and 2 (LLM text, TTS audio) are **finished and unchanged** — they stay on
+Kaggle, and the corpus is already on the Hub. Nothing regenerates. The notebooks in
+[`notebooks/`](notebooks/) remain the Kaggle path on both branches; on this branch
+the A100 path is the two shell scripts, and `csasr.train` / `csasr.eval.decode`
+were always real CLIs, so no notebook is involved.
+
+```bash
+export HF_TOKEN=$(cat ~/.hf_token)
+export HF_HOME=/scratch/$USER/hf          # NOT your home quota: 17-35 GB of cache
+python scripts/prefetch_hub.py            # only if compute nodes lack internet
+MODELS="m6 m7" bash scripts/train_a100.sh # m8 needs cv_en on the Hub first
+bash scripts/eval_a100.sh
+```
+
+Precision, TF32 and gradient checkpointing are **detected**, not assumed — see
+`_plan_hardware` in [train_whisper.py](src/csasr/train/train_whisper.py), whose
+decision table is asserted in
+[tests/test_train_hardware.py](tests/test_train_hardware.py). Every one is
+overridable (`--precision`, `--tf32`, `--gradient-checkpointing`).
+
+---
+
 ## Pipeline
 
 ```
@@ -349,8 +386,8 @@ a log, revoke it at [hf.co/settings/tokens](https://huggingface.co/settings/toke
 | # | Paper | Here | Why |
 |---|---|---|---|
 | **D1** | Llama-3.3-70B-Instruct | **Gemma-4-26B-A4B-it** GGUF via **llama.cpp** (`unsloth/gemma-4-26B-A4B-it-GGUF`, apache-2.0, ungated) | 70B is 141 GB in bf16. This is a 25.2B/3.8B-active MoE, Q4_K_M ≈ 16 GB, `tensor_split` across both T4s (one process, both GPUs). Measured ~2h26m for 4,466 calls. Replaced the dense Gemma-4-E4B: see D12. |
-| **D2** | whisper-large-v2 (1.54B) | **whisper-small** (244M) | Fits a T4. *(There is no `whisper-small-v2`; `v2`/`v3` exist only for `large`.)* |
-| **D3** | Full FT, AdamW, lr 2e-5, batch 64 | **unchanged** | A consequence of D2: whisper-small full FT fits, so no LoRA substitution is needed. |
+| **D2** | whisper-large-v2 (1.54B) | ~~whisper-small (244M)~~ → **RETIRED on `ampere`** | Applies to `main` only, where a 16 GB T4 forces whisper-small. On this branch the A100 full-fine-tunes **large-v2 — the paper's own model** — at ~24.7 GB of fp32 param+grad+Adam state, so absolute MER becomes comparable to Table 2. *(There is no `whisper-small-v2`; `v2`/`v3` exist only for `large`.)* |
+| **D3** | Full FT, AdamW, lr 2e-5, batch 64 | **unchanged** | Held on both branches. On `ampere` it is *more* faithful, not less: effective batch 64 at lr 2e-5 was the paper's recipe **for large-v2**, which is now the model we run it on. `--effective-batch` asserts `batch × accum == 64` so a bigger GPU cannot silently change the learning dynamics. |
 | **D4** | WhisperX, `language=None` | **faster-whisper** (the engine WhisperX wraps), recording-level, `language=None` | Same decoding algorithm and heuristics, minus WhisperX's forced alignment, which we don't need because we score at recording level. Our fine-tuned checkpoints are converted to CTranslate2 on first use and cached. |
 | **D5** | Common Voice (official) | `fsicoli/common_voice_17_0` | Mozilla moved CV to the Data Collective in Oct 2025; the HF repo is now an empty stub. |
 | **D6** | 4h dev from real train | same, **plus** a synthetic-only dev logged alongside | The paper's dev set is real in-domain audio, a mild leak against its "no real data" claim. |
@@ -363,8 +400,15 @@ a log, revoke it at [hf.co/settings/tokens](https://huggingface.co/settings/toke
 | **D14** | Insertional CS (Hindi frame, English terms) | **Alternational CS** (English clauses alternating with Hindi) | The sharpest form of D11, and *faithful to the paper's own prompt*. Real MUCS is **88% Hindi-matrix**, mean English run **1.70 words**, **7%** of English runs ≥4 words. Ours is **58.5% Hindi-matrix**, mean English run **3.92 words**, **48.2%** ≥4 words. But §3.2.2's prompt explicitly orders *"Make 2 sentences with English as the main language and 2 sentences with Hindi as the main language"* — a 50/50 split, against the paper's own 88/12 test set. We follow the prompt verbatim, so the mismatch is inherited, not introduced. Measured by [`scripts/grammar_probe.py`](scripts/grammar_probe.py). Expected to cost absolute MER (Whisper's decoder is an LM, and we train it on the wrong register) while leaving the M6→M7→M8 *ordering* intact. **Leading suspect if M6/M7 underperform.** |
 | **D9** | LLM obeys "a couple of words" | **We extract the switch pair from longer phrases** | The paper's 70B emitted true bigrams. Gemma 4 reliably appends a third word (`बुनियादी formatting basics`). Demanding exactly two tokens threw away **10/10** of a real Gemma-4 sample even though **8** carried a valid switch point. The *prompt* stays verbatim; only `script_filter` is more forgiving. `--strict-bigrams` restores the paper-faithful behaviour. |
 
-D1 and D2 both cost quality, so **absolute MER will not match Table 2**. The claim
-under test is the **ordering and relative gains**: `zero-shot > M6 > M7 > M8`.
+On `main`, D1 and D2 both cost quality, so absolute MER will not match Table 2 and
+the claim under test is only the **ordering**: `zero-shot > M6 > M7 > M8`.
+
+**On `ampere`, D2 is gone**, so only **D1** (the LLM, which affects the *data* and
+not the model) stands between us and the paper's absolute numbers. Gate 3 already
+put large-v2 zero-shot at **51.9 against the published 52.0**, so the instrument is
+calibrated on exactly the model being fine-tuned — the M6/M7/M8 rows can be read
+against Table 2's 48.2 / 40.8 / 39.2 directly. **D14 is the leading suspect** if
+they fall short.
 
 Also note: the paper's few-shot examples were mangled by PDF extraction into
 `pr-tEt document; bEnyAdF formatting; isspoken`. All three are recoverable verbatim

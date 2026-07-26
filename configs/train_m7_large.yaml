@@ -1,0 +1,38 @@
+# M7 on an A100: whisper-large-v2 fine-tuned on Train_T2 (23.95h synthetic).
+# Paper: MER 40.8, CBA-HE 52.3, CBA-EH 55.x
+#
+# Identical to train_m6_large.yaml except the full synthetic set is used (no
+# subset_ids). Expected: ~15% relative MER improvement over M6.
+#
+# See train_m6_large.yaml for the memory reasoning. Featurizing 18,010 clips
+# writes ~17.3 GB of Arrow cache (0.96 MB per clip); point HF_HOME at scratch,
+# not at a home quota.
+
+model: openai/whisper-large-v2
+out: exp/m7_large
+
+train_hf: RohanRamesh/hi-en-synth-cs
+train_config: synth_t2
+subset_ids: null
+
+dev_hf: RohanRamesh/mucs-he-cs
+dev_config: dev
+
+language: hi
+
+lr: 2.0e-5
+batch_size: 16
+grad_accum: 4
+eval_batch_size: 8
+max_steps: 5000
+warmup_steps: 200
+eval_steps: 250
+patience: 4
+seed: 1234
+
+precision: auto
+tf32: auto
+gradient_checkpointing: auto
+attn_impl: auto
+num_proc: 8
+dataloader_workers: 8

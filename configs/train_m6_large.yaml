@@ -1,0 +1,48 @@
+# M6 on an A100: whisper-large-v2 fine-tuned on Train_T1 (8h synthetic).
+# Paper: MER 48.2, CBA-HE 45.5, CBA-EH 45.x
+#
+# NO DEVIATION D2 ON THIS PATH. This is the paper's own model, so absolute MER is
+# directly comparable to Table 2 -- not merely the M6 > M7 > M8 ordering. Gate 3
+# already calibrated the metrics against large-v2 zero-shot at 51.9 vs the
+# paper's 52.0, so the baseline row for this column exists and is verified.
+#
+# The paper's optimizer recipe is kept intact (D3): full fine-tune, AdamW,
+# lr 2e-5, effective batch 64. On large-v2 that means ~24.7 GB of fp32
+# param+grad+Adam state, so:
+#   * 40 GB A100 -> gradient checkpointing ON  (auto-detected)
+#   * 80 GB A100 -> OFF, ~30-40% faster       (auto-detected)
+# Keep batch_size 16: raising it does NOT fit large-v2 activations on a 40 GB
+# card, and the speedup here comes from bf16 + TF32 + the card, not a bigger
+# batch. If VRAM is tight, set optim: adamw_bnb_8bit (12.3 GB -> ~3 GB).
+
+model: openai/whisper-large-v2
+out: exp/m6_large
+
+train_hf: RohanRamesh/hi-en-synth-cs
+train_config: synth_t2
+subset_ids: t1_ids.json          # <- what makes this M6 rather than M7
+
+dev_hf: RohanRamesh/mucs-he-cs
+dev_config: dev
+
+language: hi                     # <|hi|> prompt for all of M6/M7/M8, per Table 2
+
+lr: 2.0e-5
+batch_size: 16
+grad_accum: 4                    # 16 x 4 = 64 effective, the paper's batch
+eval_batch_size: 8               # predict_with_generate: 225 tokens of KV cache
+                                 # per sequence. Reusing batch_size OOMs at the
+                                 # FIRST eval, 250 steps in -- not at startup.
+max_steps: 5000
+warmup_steps: 200
+eval_steps: 250
+patience: 4
+seed: 1234
+
+# auto everywhere: bf16 + TF32 on Ampere, fp16 on Turing, checkpointing by VRAM.
+precision: auto
+tf32: auto
+gradient_checkpointing: auto
+attn_impl: auto
+num_proc: 8                      # safe again since TOKENIZERS_PARALLELISM=false
+dataloader_workers: 8
