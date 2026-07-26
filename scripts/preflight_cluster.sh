@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Answer, in about a minute, the questions the training run would otherwise
 # answer by dying 40 minutes in.
 #

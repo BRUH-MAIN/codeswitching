@@ -1,10 +1,17 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Train M6 / M7 / M8 on one GPU. No notebook involved -- csasr.train is a real
 # CLI, which is the payoff of having kept the Kaggle notebooks thin.
 #
+#   cd /path/to/codeswitching               # sbatch FROM THE REPO ROOT
 #   sbatch scripts/preflight_cluster.sh     # DO THIS FIRST (~1 min)
 #   sbatch scripts/train_a100.sh
-#   MODELS="m6 m7" sbatch scripts/train_a100.sh
+#   sbatch --export=ALL,MODELS="m6 m7" scripts/train_a100.sh
+#
+# `MODELS=... sbatch ...` also works, but only because sbatch defaults to
+# --export=ALL. Some sites configure --export=NONE, and then the variable
+# silently vanishes and you get all three models. --export=ALL,VAR=... is
+# explicit and works either way. HF_TOKEN travels by the same mechanism, so if
+# the token check below trips on a site you know exports it, that is why.
 #
 # SBATCH header follows the site template. `--gres=gpu:1` does not say WHICH
 # card you get, so nothing below assumes an A100: precision, TF32 and gradient
@@ -23,6 +30,28 @@
 set -euo pipefail
 
 PY=${PYTHON:-python3}          # the site template calls python3, not python
+
+# ---- locate the repo -------------------------------------------------------
+# sbatch COPIES this script to /var/spool/slurmd/job*/slurm_script and runs it
+# from there, so "${BASH_SOURCE[0]}" points at the spool copy, not the checkout.
+# $SLURM_SUBMIT_DIR (the directory you ran sbatch from) is the only reliable
+# anchor under sbatch; BASH_SOURCE is the fallback for `bash scripts/...`.
+if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+    REPO=$SLURM_SUBMIT_DIR
+else
+    REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+fi
+: "${REPO:=$PWD}"
+
+if [[ ! -f "$REPO/configs/train_m7_large.yaml" ]]; then
+    echo "Cannot find configs/ under REPO=$REPO." >&2
+    echo "  Under sbatch, REPO is \$SLURM_SUBMIT_DIR -- so submit from the repo root:" >&2
+    echo "      cd /path/to/codeswitching && sbatch scripts/train_a100.sh" >&2
+    echo "  Or override:  REPO=/path/to/codeswitching sbatch scripts/train_a100.sh" >&2
+    exit 1
+fi
+cd "$REPO"
+echo "[repo] $REPO"
 
 # ---- where the big files go ------------------------------------------------
 # This needs ~60 GB and it must NOT be a quota'd home directory:

@@ -1,10 +1,13 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Decode and score M6 / M7 / M8 on the A100, straight from the local checkpoints
 # that train_a100.sh wrote. No notebook and no Hub round-trip needed --
 # csasr.eval.decode takes a local directory just as happily as a hub id.
 #
-#   bash scripts/eval_a100.sh
-#   MODELS="m6 m7" bash scripts/eval_a100.sh
+#   cd /path/to/codeswitching               # sbatch FROM THE REPO ROOT
+#   sbatch scripts/eval_a100.sh
+#   sbatch --export=ALL,MODELS="m6 m7" scripts/eval_a100.sh
+#
+# WORKDIR must match the training run, or the checkpoints will not be found.
 #
 # The zero-shot large-v2 row is Gate 3, and it doubles as the BASELINE for this
 # column: we already measured 51.9 MER / 42.9 CBA-HE against the paper's 52.0.
@@ -23,6 +26,16 @@
 set -euo pipefail
 
 PY=${PYTHON:-python3}
+
+# sbatch runs a COPY of this script from the spool dir, so BASH_SOURCE does not
+# locate the checkout. $SLURM_SUBMIT_DIR does. See train_a100.sh for the detail.
+if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+    REPO=$SLURM_SUBMIT_DIR
+else
+    REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+fi
+cd "$REPO"
+echo "[repo] $REPO"
 
 # Must match what train_a100.sh used, or the checkpoints will not be found.
 : "${WORKDIR:=${SLURM_SUBMIT_DIR:-$PWD}/csasr-work}"
