@@ -21,8 +21,7 @@
 #SBATCH --job-name=csasr-t2
 #SBATCH --partition=workq
 #SBATCH --time=24:00:00
-#SBATCH --constraint=a100
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --output=slurm-train-%j.out
