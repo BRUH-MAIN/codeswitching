@@ -87,6 +87,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--num-proc", type=int, default=1, help="datasets.map workers")
     ap.add_argument("--dataloader-workers", type=int, default=2)
     ap.add_argument("--report-to", default="auto", help="'auto' uses tensorboard if installed")
+
+    # Resumability: the Trainer's full checkpoint (model + optimizer + scheduler
+    # + RNG + trainer_state.json) is pushed to this Hub repo every --eval-steps
+    # and cleared once the run finishes normally. A session killed mid-run
+    # leaves its last checkpoint in place, so re-running the same command
+    # resumes instead of starting over. Omit to disable (local-only, as before).
+    ap.add_argument("--hub-checkpoint-repo", default=None,
+                    help="e.g. RohanRamesh/csasr-train-checkpoints")
+    ap.add_argument("--run-name", default=None,
+                    help="subfolder key within --hub-checkpoint-repo; defaults to --out's basename")
+    ap.add_argument("--no-resume", action="store_true",
+                    help="ignore any existing Hub checkpoint and start this run from scratch")
     args = ap.parse_args(argv)
 
     import torch
@@ -102,8 +114,22 @@ def main(argv: list[str] | None = None) -> int:
     from ..eval.cba import cba
     from ..eval.mer import mer
     from .collator import WhisperCollator
+    from .hub_checkpoint import build_hub_checkpoint_callback, clear_checkpoint, download_checkpoint
 
     hf_token = args.hf_token or os.environ.get("HF_TOKEN")
+    run_name = args.run_name or args.out.name
+    hub_resume_dir = str(args.out) + "-hub-resume"
+
+    resume_checkpoint = None
+    if args.hub_checkpoint_repo and not args.no_resume:
+        resume_checkpoint = download_checkpoint(
+            args.hub_checkpoint_repo, run_name, token=hf_token,
+            local_dir=hub_resume_dir, kind="last",
+        )
+        if resume_checkpoint:
+            print(f"[train] resuming {run_name!r} from Hub checkpoint: {resume_checkpoint}")
+        else:
+            print(f"[train] no existing Hub checkpoint for {run_name!r}; starting fresh")
 
     if not torch.cuda.is_available():
         print("[train] WARNING: no CUDA device; this will be unusably slow")
@@ -197,6 +223,18 @@ def main(argv: list[str] | None = None) -> int:
         dataloader_num_workers=args.dataloader_workers,
     )
 
+    callbacks = [EarlyStoppingCallback(early_stopping_patience=args.patience)]
+    if args.hub_checkpoint_repo:
+        # NOTE: EarlyStoppingCallback's own non-improvement counter is plain
+        # instance state, not part of `trainer_state.json` -- resuming restores
+        # `best_metric` correctly (so a resumed run can't regress its notion of
+        # "best"), but the count of consecutive bad evals restarts at 0. Net
+        # effect is a small conservative bias (occasionally a few evals later
+        # to stop than an uninterrupted run), never early stopping too soon.
+        callbacks.append(
+            build_hub_checkpoint_callback(args.hub_checkpoint_repo, run_name, token=hf_token)
+        )
+
     trainer = Seq2SeqTrainer(
         args=targs,
         model=model,
@@ -205,12 +243,43 @@ def main(argv: list[str] | None = None) -> int:
         data_collator=collator,
         compute_metrics=compute_metrics,
         processing_class=processor,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=args.patience)],
+        callbacks=callbacks,
     )
 
-    result = trainer.train()
+    result = trainer.train(
+        resume_from_checkpoint=str(resume_checkpoint) if resume_checkpoint else None
+    )
+
+    # `load_best_model_at_end` already tried to reload `state.best_model_checkpoint`
+    # -- a path on THIS machine's disk. That's a no-op in the common case (best ==
+    # last, or nothing crashed), but if a previous session died right after saving
+    # a checkpoint that was later beaten, then got resumed here, the true best
+    # checkpoint's weights may only exist on the Hub, not on this fresh disk.
+    # Recover them explicitly rather than silently shipping a worse final model.
+    best_path = trainer.state.best_model_checkpoint
+    if args.hub_checkpoint_repo and best_path and not Path(best_path).exists():
+        print(f"[train] best checkpoint {best_path} is not on local disk "
+              f"(training was resumed on a different machine); pulling it from the Hub")
+        best_dir = download_checkpoint(
+            args.hub_checkpoint_repo, run_name, token=hf_token,
+            local_dir=hub_resume_dir, kind="best",
+        )
+        if best_dir:
+            trainer.model = WhisperForConditionalGeneration.from_pretrained(str(best_dir))
+            print(f"[train] loaded best checkpoint from the Hub -> {best_dir}")
+        else:
+            print("[train] WARNING: could not recover the best checkpoint from the Hub; "
+                  "saving the model as it currently stands (the last resumed step) instead")
+
     trainer.save_model(str(args.out))
     processor.save_pretrained(str(args.out))
+
+    # Only clear the Hub's resumable state once the final model is safely on
+    # local disk. Doing this any earlier (e.g. from an on_train_end callback,
+    # which fires before this point) would delete the one thing a crash during
+    # save_model() could still be recovered from.
+    if args.hub_checkpoint_repo:
+        clear_checkpoint(args.hub_checkpoint_repo, run_name, token=hf_token)
 
     print(f"[train] finished at step {result.global_step:,} "
           f"(max_steps={args.max_steps}; early stopping may have fired)")

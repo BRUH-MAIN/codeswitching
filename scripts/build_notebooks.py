@@ -563,6 +563,16 @@ a FLAC decode, so one worker costs only a few minutes across the whole corpus.
 for M8. Left to accumulate that is ~61 GB and M8 dies with *No space left on device*
 partway through. `free_map_cache()` runs before M7 and M8 and deletes only the
 `cache-*.arrow` files, keeping the expensive parquet download.
+
+**A killed session used to mean starting the current model over from step 0.**
+Kaggle can kill a session (walltime cap, disconnect) with no warning and no chance
+to run cleanup code, and `/kaggle/working` dies with it. Every `run(...)` call below
+now passes `--hub-checkpoint-repo`: the Trainer's full checkpoint (model + optimizer
++ scheduler + RNG + `trainer_state.json`, not just weights) is pushed to a private
+Hub repo every `--eval-steps` and cleared once that model finishes cleanly.
+Re-running this notebook after a crash therefore does the right thing automatically:
+`model_already_trained()` skips whichever of M6/M7/M8 already finished, and the one
+that was interrupted resumes from its last pushed checkpoint instead of restarting.
 """),
 
     code(f"""
@@ -595,17 +605,33 @@ os.environ["HF_HOME"] = "/kaggle/temp/hf"
 from kaggle_secrets import UserSecretsClient
 # Token goes in the environment, never in argv (it leaks into every traceback).
 os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
-from huggingface_hub import hf_hub_download, login
+from huggingface_hub import HfApi, hf_hub_download, login
 login(token=os.environ["HF_TOKEN"])
 HF_TOKEN = os.environ["HF_TOKEN"]   # for load_dataset / hf_hub_download only
+hub_api = HfApi(token=HF_TOKEN)
 
 SYNTH = "RohanRamesh/hi-en-synth-cs"
 REAL  = "RohanRamesh/mucs-he-cs"
 MODEL = "openai/whisper-small"
+# Resumable checkpoints for ALL of smoke/M6/M7/M8 live here, one subfolder per
+# run (m6/last-checkpoint, m6/best-checkpoint, m7/...). See hub_checkpoint.py.
+CKPT_REPO = "RohanRamesh/csasr-train-checkpoints"
 
 def run(*args):
     print(">", " ".join(str(a) for a in args), flush=True)
     subprocess.run([sys.executable, "-m", *args], check=True)
+
+def model_already_trained(repo_id: str) -> bool:
+    \"\"\"Has `repo_id` already been fully trained and pushed?
+
+    Lets a re-run of this notebook after a killed session skip whichever
+    model(s) already finished -- only the interrupted one needs to resume.
+    \"\"\"
+    try:
+        files = hub_api.list_repo_files(repo_id, token=HF_TOKEN)
+    except Exception:
+        return False
+    return any(f.endswith((".safetensors", ".bin")) for f in files)
 
 def free_map_cache():
     \"\"\"Delete the featurized Arrow cache, keeping the downloaded parquet.
@@ -637,26 +663,35 @@ run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/smo
     "--train-hf", SYNTH, "--train-config", "synth_t2",
     "--dev-hf", REAL, "--dev-config", "dev",
     "--max-steps", "20", "--eval-steps", "10", "--dataset-fraction", "0.01",
-    "--batch-size", "4", "--grad-accum", "1")
+    "--batch-size", "4", "--grad-accum", "1",
+    "--hub-checkpoint-repo", CKPT_REPO)
 """),
 
-    md("## M6 — Train_T1 (8h synthetic)"),
+    md("## M6 — Train_T1 (8h synthetic)\n\nSkipped automatically if `RohanRamesh/whisper-small-cs-m6` already exists (e.g. this notebook is re-running after a killed session)."),
     code("""
-run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/m6",
-    "--train-hf", SYNTH, "--train-config", "synth_t2", "--subset-ids", t1_ids,
-    "--dev-hf", REAL, "--dev-config", "dev",
-    "--lr", "2e-5", "--batch-size", "16", "--grad-accum", "4",
-    "--max-steps", "5000", "--eval-steps", "250", "--patience", "4")
+if model_already_trained("RohanRamesh/whisper-small-cs-m6"):
+    print("[skip] RohanRamesh/whisper-small-cs-m6 already exists")
+else:
+    run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/m6",
+        "--train-hf", SYNTH, "--train-config", "synth_t2", "--subset-ids", t1_ids,
+        "--dev-hf", REAL, "--dev-config", "dev",
+        "--lr", "2e-5", "--batch-size", "16", "--grad-accum", "4",
+        "--max-steps", "5000", "--eval-steps", "250", "--patience", "4",
+        "--hub-checkpoint-repo", CKPT_REPO)
 """),
 
-    md("## M7 — Train_T2 (22h synthetic)\n\nClear M6's featurized cache first — see `free_map_cache()` above for why."),
+    md("## M7 — Train_T2 (22h synthetic)\n\nClear M6's featurized cache first — see `free_map_cache()` above for why. Skipped automatically if `RohanRamesh/whisper-small-cs-m7` already exists."),
     code("""
 free_map_cache()
-run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/m7",
-    "--train-hf", SYNTH, "--train-config", "synth_t2",
-    "--dev-hf", REAL, "--dev-config", "dev",
-    "--lr", "2e-5", "--batch-size", "16", "--grad-accum", "4",
-    "--max-steps", "5000", "--eval-steps", "250", "--patience", "4")
+if model_already_trained("RohanRamesh/whisper-small-cs-m7"):
+    print("[skip] RohanRamesh/whisper-small-cs-m7 already exists")
+else:
+    run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/m7",
+        "--train-hf", SYNTH, "--train-config", "synth_t2",
+        "--dev-hf", REAL, "--dev-config", "dev",
+        "--lr", "2e-5", "--batch-size", "16", "--grad-accum", "4",
+        "--max-steps", "5000", "--eval-steps", "250", "--patience", "4",
+        "--hub-checkpoint-repo", CKPT_REPO)
 """),
 
     md("""
@@ -666,25 +701,38 @@ Still one `<|hi|>` prompt for everything: language-*specific* prompting is Track
 
 **This is the run that fills the disk.** ~37,000 clips x 0.96 MB = **~35.5 GB** of
 featurized Arrow, so clearing M7's cache first is not optional.
+
+Skipped automatically if `RohanRamesh/whisper-small-cs-m8` already exists.
 """),
     code("""
 free_map_cache()
-run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/m8",
-    "--train-hf", SYNTH, "--train-config", "synth_t2",
-    "--extra-hf", f"{REAL}:cv_hi", f"{REAL}:cv_en",
-    "--dev-hf", REAL, "--dev-config", "dev",
-    "--lr", "2e-5", "--batch-size", "16", "--grad-accum", "4",
-    "--max-steps", "5000", "--eval-steps", "250", "--patience", "4")
+if model_already_trained("RohanRamesh/whisper-small-cs-m8"):
+    print("[skip] RohanRamesh/whisper-small-cs-m8 already exists")
+else:
+    run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/m8",
+        "--train-hf", SYNTH, "--train-config", "synth_t2",
+        "--extra-hf", f"{REAL}:cv_hi", f"{REAL}:cv_en",
+        "--dev-hf", REAL, "--dev-config", "dev",
+        "--lr", "2e-5", "--batch-size", "16", "--grad-accum", "4",
+        "--max-steps", "5000", "--eval-steps", "250", "--patience", "4",
+        "--hub-checkpoint-repo", CKPT_REPO)
 """),
 
-    md("## Push checkpoints so `03_eval` can find them"),
+    md("""## Push checkpoints so `03_eval` can find them
+
+A model that was skipped above (already trained in an earlier session) is already
+on the Hub, so re-pushing it here is a harmless no-op -- `upload_folder` just
+re-uploads identical files.
+"""),
     code("""
-from huggingface_hub import HfApi
-api = HfApi()
 for m in ("m6", "m7", "m8"):
+    local = Path(f"/kaggle/working/{m}")
+    if not local.exists():
+        print(f"[skip push] {m}: no local output (trained in an earlier session, already on the Hub)")
+        continue
     repo = f"RohanRamesh/whisper-small-cs-{m}"
-    api.create_repo(repo, exist_ok=True, private=True, token=HF_TOKEN)
-    api.upload_folder(folder_path=f"/kaggle/working/{m}", repo_id=repo, token=HF_TOKEN)
+    hub_api.create_repo(repo, exist_ok=True, private=True, token=HF_TOKEN)
+    hub_api.upload_folder(folder_path=str(local), repo_id=repo, token=HF_TOKEN)
     print("pushed", repo)
 """),
 ])
