@@ -3,6 +3,12 @@
 #
 # Identical to M6 except the full synthetic set is used (no subset_ids).
 # Expected: ~15% relative MER improvement over M6.
+#
+# TEMPORARY, budget-driven (not reflected below): 02_train.ipynb currently runs
+# openai/whisper-base with max_steps/eval_steps/patience capped well under this
+# file's numbers -- Kaggle's free-tier quota turned out to be ~6h/day, not 30h/
+# week. This file still documents the INTENDED recipe; see that notebook's intro
+# cell for the override and how to revert it once quota allows.
 
 model: openai/whisper-small
 out: exp/m7

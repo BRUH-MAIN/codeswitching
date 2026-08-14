@@ -549,6 +549,15 @@ AdamW, lr 2e-5, effective batch 64.
 Deviation D2: the paper used whisper-large-v2 (1.54B). Absolute MER will be far worse;
 what we test is the **M6 → M7 → M8 ordering**.
 
+**Temporary further deviation, budget-driven, not a pipeline decision:** `MODEL` is
+currently `openai/whisper-base` (74M) and steps/eval/patience are capped well below the
+paper's 5000-step ceiling. Kaggle's free-tier GPU quota turned out to be a **~6h/day**
+allowance rather than a 30h/week pool, which doesn't fit whisper-small's full recipe
+before a hard deadline. Swap `MODEL` back to `openai/whisper-small` and `MAX_STEPS` back
+to `"5000"` (with `EVAL_STEPS="250"`, `PATIENCE="4"`) once that stops being the binding
+constraint -- nothing else in this notebook or in `train_whisper.py` needs to change to
+do that.
+
 ### Two things that used to break this notebook
 
 **Featurization used to hang forever.** `datasets.map(num_proc=2)` forks after the
@@ -612,10 +621,20 @@ hub_api = HfApi(token=HF_TOKEN)
 
 SYNTH = "RohanRamesh/hi-en-synth-cs"
 REAL  = "RohanRamesh/mucs-he-cs"
-MODEL = "openai/whisper-small"
+# DEVIATION (temporary, budget-driven): whisper-base (74M), not whisper-small
+# (244M) -- Kaggle's free-tier GPU quota turned out to be a ~6h/day allowance,
+# not a 30h/week pool, which doesn't fit whisper-small's full recipe before a
+# hard deadline. Swap back to "openai/whisper-small" once there's more budget.
+MODEL = "openai/whisper-base"
 # Resumable checkpoints for ALL of smoke/M6/M7/M8 live here, one subfolder per
 # run (m6/last-checkpoint, m6/best-checkpoint, m7/...). See hub_checkpoint.py.
 CKPT_REPO = "RohanRamesh/csasr-train-checkpoints"
+# Same budget reason: capped well below the paper's 5000-step ceiling instead
+# of trusting early stopping's unknown timing to cut it short on its own, and
+# M8 (the most expensive model, ~6x M6's per-epoch cost) is parked behind
+# TRAIN_M8 rather than removed -- flip it back on once quota allows.
+MAX_STEPS, EVAL_STEPS, PATIENCE = "800", "200", "3"
+TRAIN_M8 = False
 
 def run(*args):
     print(">", " ".join(str(a) for a in args), flush=True)
@@ -667,30 +686,30 @@ run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/smo
     "--hub-checkpoint-repo", CKPT_REPO)
 """),
 
-    md("## M6 — Train_T1 (8h synthetic)\n\nSkipped automatically if `RohanRamesh/whisper-small-cs-m6` already exists (e.g. this notebook is re-running after a killed session)."),
+    md("## M6 — Train_T1 (8h synthetic)\n\nSkipped automatically if `RohanRamesh/whisper-base-cs-m6` already exists (e.g. this notebook is re-running after a killed session)."),
     code("""
-if model_already_trained("RohanRamesh/whisper-small-cs-m6"):
-    print("[skip] RohanRamesh/whisper-small-cs-m6 already exists")
+if model_already_trained("RohanRamesh/whisper-base-cs-m6"):
+    print("[skip] RohanRamesh/whisper-base-cs-m6 already exists")
 else:
     run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/m6",
         "--train-hf", SYNTH, "--train-config", "synth_t2", "--subset-ids", t1_ids,
         "--dev-hf", REAL, "--dev-config", "dev",
         "--lr", "2e-5", "--batch-size", "16", "--grad-accum", "4",
-        "--max-steps", "5000", "--eval-steps", "250", "--patience", "4",
+        "--max-steps", MAX_STEPS, "--eval-steps", EVAL_STEPS, "--patience", PATIENCE,
         "--hub-checkpoint-repo", CKPT_REPO)
 """),
 
-    md("## M7 — Train_T2 (22h synthetic)\n\nClear M6's featurized cache first — see `free_map_cache()` above for why. Skipped automatically if `RohanRamesh/whisper-small-cs-m7` already exists."),
+    md("## M7 — Train_T2 (22h synthetic)\n\nClear M6's featurized cache first — see `free_map_cache()` above for why. Skipped automatically if `RohanRamesh/whisper-base-cs-m7` already exists."),
     code("""
 free_map_cache()
-if model_already_trained("RohanRamesh/whisper-small-cs-m7"):
-    print("[skip] RohanRamesh/whisper-small-cs-m7 already exists")
+if model_already_trained("RohanRamesh/whisper-base-cs-m7"):
+    print("[skip] RohanRamesh/whisper-base-cs-m7 already exists")
 else:
     run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/m7",
         "--train-hf", SYNTH, "--train-config", "synth_t2",
         "--dev-hf", REAL, "--dev-config", "dev",
         "--lr", "2e-5", "--batch-size", "16", "--grad-accum", "4",
-        "--max-steps", "5000", "--eval-steps", "250", "--patience", "4",
+        "--max-steps", MAX_STEPS, "--eval-steps", EVAL_STEPS, "--patience", PATIENCE,
         "--hub-checkpoint-repo", CKPT_REPO)
 """),
 
@@ -702,35 +721,42 @@ Still one `<|hi|>` prompt for everything: language-*specific* prompting is Track
 **This is the run that fills the disk.** ~37,000 clips x 0.96 MB = **~35.5 GB** of
 featurized Arrow, so clearing M7's cache first is not optional.
 
-Skipped automatically if `RohanRamesh/whisper-small-cs-m8` already exists.
+Gated behind `TRAIN_M8` (currently `False`) -- the most expensive of the three models
+(~6x M6's per-epoch cost), parked until there's more GPU budget than a weekend's free-tier
+allowance. Flip the flag in the setup cell above once that's no longer the constraint.
+Skipped automatically either way if `RohanRamesh/whisper-base-cs-m8` already exists.
 """),
     code("""
-free_map_cache()
-if model_already_trained("RohanRamesh/whisper-small-cs-m8"):
-    print("[skip] RohanRamesh/whisper-small-cs-m8 already exists")
+if not TRAIN_M8:
+    print("[skip] TRAIN_M8 is False")
 else:
-    run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/m8",
-        "--train-hf", SYNTH, "--train-config", "synth_t2",
-        "--extra-hf", f"{REAL}:cv_hi", f"{REAL}:cv_en",
-        "--dev-hf", REAL, "--dev-config", "dev",
-        "--lr", "2e-5", "--batch-size", "16", "--grad-accum", "4",
-        "--max-steps", "5000", "--eval-steps", "250", "--patience", "4",
-        "--hub-checkpoint-repo", CKPT_REPO)
+    free_map_cache()
+    if model_already_trained("RohanRamesh/whisper-base-cs-m8"):
+        print("[skip] RohanRamesh/whisper-base-cs-m8 already exists")
+    else:
+        run("csasr.train.train_whisper", "--model", MODEL, "--out", "/kaggle/working/m8",
+            "--train-hf", SYNTH, "--train-config", "synth_t2",
+            "--extra-hf", f"{REAL}:cv_hi", f"{REAL}:cv_en",
+            "--dev-hf", REAL, "--dev-config", "dev",
+            "--lr", "2e-5", "--batch-size", "16", "--grad-accum", "4",
+            "--max-steps", MAX_STEPS, "--eval-steps", EVAL_STEPS, "--patience", PATIENCE,
+            "--hub-checkpoint-repo", CKPT_REPO)
 """),
 
     md("""## Push checkpoints so `03_eval` can find them
 
-A model that was skipped above (already trained in an earlier session) is already
-on the Hub, so re-pushing it here is a harmless no-op -- `upload_folder` just
-re-uploads identical files.
+A model that was skipped above (already trained in an earlier session, or parked behind
+`TRAIN_M8`) either doesn't exist locally or is already on the Hub, so this loop is a
+harmless no-op for it -- `upload_folder` just re-uploads identical files where there's
+anything to push at all.
 """),
     code("""
 for m in ("m6", "m7", "m8"):
     local = Path(f"/kaggle/working/{m}")
     if not local.exists():
-        print(f"[skip push] {m}: no local output (trained in an earlier session, already on the Hub)")
+        print(f"[skip push] {m}: no local output (not trained this session)")
         continue
-    repo = f"RohanRamesh/whisper-small-cs-{m}"
+    repo = f"RohanRamesh/whisper-base-cs-{m}"
     hub_api.create_repo(repo, exist_ok=True, private=True, token=HF_TOKEN)
     hub_api.upload_folder(folder_path=str(local), repo_id=repo, token=HF_TOKEN)
     print("pushed", repo)
@@ -756,7 +782,9 @@ normalization, word-level language ID, and both metrics end to end. It is **not*
 our baseline — it is the calibration of the measuring instrument. A broken metric
 makes every downstream result uninterpretable.
 
-Then decode M6/M7/M8 and the `whisper-small` zero-shot baseline they are measured against.
+Then decode M6/M7/M8 and the zero-shot baseline of whatever base model they were fine-tuned
+from (currently `whisper-base` -- see `02_train.ipynb`'s temporary budget-driven deviation;
+update `BASE_MODEL` below to match if that changes).
 
 ### Decoding reproduces WhisperX, not a per-clip loop
 The paper decodes whole recordings with WhisperX. We use **faster-whisper**, the engine
@@ -851,6 +879,9 @@ from csasr.manifest import read_jsonl, write_jsonl
 from csasr.eval.ct2 import resolve_ct2
 
 CT2 = "/kaggle/temp/ct2"
+# Must match 02_train.ipynb's MODEL -- currently whisper-base for budget reasons
+# (see that notebook's intro cell). Update together if that changes.
+BASE_MODEL = "openai/whisper-base"
 
 def decode(model, out_name, batch_size=16):
     \"\"\"Shard the 30 recordings across every GPU, decode in parallel, merge.\"\"\"
@@ -958,9 +989,9 @@ for p in ("raw", "punct", "scoring"):
     print(f"MER preset={p:8}: {mer(R, H, preset=p):.1f}")
 """),
 
-    md("## whisper-small zero-shot — the actual baseline for M6/M7/M8\n\nExpect its CBA ≈ 0: whisper-small transliterates English into Devanagari, so it has no script boundary to match. That is the model, not the pipeline — and it is exactly what fine-tuning is supposed to fix."),
+    md("## BASE_MODEL zero-shot — the actual baseline for M6/M7/M8\n\nExpect its CBA ≈ 0: an un-fine-tuned Whisper transliterates English into Devanagari, so it has no script boundary to match. That is the model, not the pipeline — and it is exactly what fine-tuning is supposed to fix."),
     code("""
-decode("openai/whisper-small", "hyp_small_zeroshot")
+decode(BASE_MODEL, "hyp_base_zeroshot")
 """),
 
     md("""## Decode the fine-tuned models
@@ -970,14 +1001,14 @@ faster-whisper can load it. Run this **only after** `02_train.ipynb` has pushed 
 otherwise you get a 404, which is expected, not a bug."""),
     code("""
 for m in ("m6", "m7", "m8"):
-    decode(f"RohanRamesh/whisper-small-cs-{m}", f"hyp_{m}")
+    decode(f"RohanRamesh/whisper-base-cs-{m}", f"hyp_{m}")
 """),
 
     md("## Results — reproduce the ordering of Table 2"),
     code("""
 systems = [
     ("large-v2 zero-shot", "hyp_largev2_zeroshot.jsonl", 52.0),
-    ("small zero-shot",    "hyp_small_zeroshot.jsonl",   None),
+    ("base zero-shot",     "hyp_base_zeroshot.jsonl",    None),
     ("M6 (T1, 8h)",        "hyp_m6.jsonl",               48.2),
     ("M7 (T2, 22h)",       "hyp_m7.jsonl",               40.8),
     ("M8 (T2 + mono)",     "hyp_m8.jsonl",               39.2),
