@@ -630,11 +630,13 @@ MODEL = "openai/whisper-base"
 # run (m6/last-checkpoint, m6/best-checkpoint, m7/...). See hub_checkpoint.py.
 CKPT_REPO = "RohanRamesh/csasr-train-checkpoints"
 # Same budget reason: capped well below the paper's 5000-step ceiling instead
-# of trusting early stopping's unknown timing to cut it short on its own, and
-# M8 (the most expensive model, ~6x M6's per-epoch cost) is parked behind
-# TRAIN_M8 rather than removed -- flip it back on once quota allows.
+# of trusting early stopping's unknown timing to cut it short on its own. M8
+# stayed behind this flag (rather than being removed) until M6/M7 confirmed the
+# capped recipe actually works -- they did (both finished cleanly, M7 < M6 as
+# expected), so M8 is on. Its per-step cost is the same as M6/M7's (the 800-step
+# cap bounds wall-clock, not dataset size); only featurization is bigger.
 MAX_STEPS, EVAL_STEPS, PATIENCE = "800", "200", "3"
-TRAIN_M8 = False
+TRAIN_M8 = True
 
 def run(*args):
     print(">", " ".join(str(a) for a in args), flush=True)
@@ -721,10 +723,12 @@ Still one `<|hi|>` prompt for everything: language-*specific* prompting is Track
 **This is the run that fills the disk.** ~37,000 clips x 0.96 MB = **~35.5 GB** of
 featurized Arrow, so clearing M7's cache first is not optional.
 
-Gated behind `TRAIN_M8` (currently `False`) -- the most expensive of the three models
-(~6x M6's per-epoch cost), parked until there's more GPU budget than a weekend's free-tier
-allowance. Flip the flag in the setup cell above once that's no longer the constraint.
-Skipped automatically either way if `RohanRamesh/whisper-base-cs-m8` already exists.
+Gated behind `TRAIN_M8` (currently `True`) -- the most expensive of the three models
+(~6x M6's per-epoch cost). M6 and M7 both finished cleanly under the capped recipe with
+the expected M7 < M6 ordering, so M8 is now on too. Its per-step cost matches M6/M7's
+(the 800-step cap bounds wall-clock, not dataset size); the extra time is mostly a bigger
+one-time featurization pass. Skipped automatically if `RohanRamesh/whisper-base-cs-m8`
+already exists, same as M6/M7 skip if already trained.
 """),
     code("""
 if not TRAIN_M8:

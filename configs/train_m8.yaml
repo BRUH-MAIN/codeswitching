@@ -6,11 +6,11 @@
 #
 # Expected: ~4% relative MER improvement over M7.
 #
-# TEMPORARY, budget-driven: parked behind TRAIN_M8=False in 02_train.ipynb for
-# now -- the most expensive of the three models (~6x M6's per-epoch cost), and
-# Kaggle's free-tier quota turned out to be ~6h/day, not 30h/week. When it does
-# run, it currently uses openai/whisper-base with max_steps/eval_steps/patience
-# capped well under this file's numbers. This file still documents the INTENDED
+# TEMPORARY, budget-driven: 02_train.ipynb currently runs this behind a TRAIN_M8
+# flag (now True -- M6/M7 confirmed the capped recipe works, expected M7 < M6
+# ordering held) with openai/whisper-base and max_steps/eval_steps/patience
+# capped well under this file's numbers, because Kaggle's free-tier quota turned
+# out to be ~6h/day, not 30h/week. This file still documents the INTENDED
 # recipe; see that notebook's intro cell for the override and how to revert it.
 
 model: openai/whisper-small
