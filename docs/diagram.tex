@@ -1,0 +1,191 @@
+% =====================================================================
+%  diagram.tex -- pipeline diagram, Track 2 replication (Biswas et al. 2025)
+%
+%  Compile standalone (tight-cropped PDF):
+%      pdflatex diagram.tex
+%
+%  Or drop into a paper:
+%      \includegraphics[width=\textwidth]{diagram.pdf}
+%  ...or \input{diagram.tex} after removing the \documentclass/\begin{document}
+%  wrapper and keeping only the tikzpicture.
+%
+%  Plain pdflatex is enough -- no Devanagari, no fontspec, no exotic packages.
+% =====================================================================
+
+\documentclass[border=10pt]{standalone}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,fit,backgrounds}
+
+% ---- palette --------------------------------------------------------
+\definecolor{csInk}    {HTML}{1A2333}   % body text
+\definecolor{csGrey}   {HTML}{5B6675}   % secondary text, flow arrows
+\definecolor{csCPU}    {HTML}{276460}   % local / CPU stages
+\definecolor{csGPU}    {HTML}{9C5A17}   % Kaggle / GPU stages
+\definecolor{csHub}    {HTML}{2F5D8A}   % Hugging Face Hub
+\definecolor{csGate}   {HTML}{B33951}   % gates
+\definecolor{csFill}   {HTML}{F6F7F4}
+\definecolor{csHubFill}{HTML}{EDF1F6}
+
+\begin{document}
+\begin{tikzpicture}[
+  font=\sffamily\footnotesize,
+  >={Stealth[length=2.2mm,width=1.8mm]},
+  %
+  stage/.style={
+    draw, line width=0.8pt, fill=csFill, rounded corners=2pt,
+    inner sep=6pt, text width=34mm, align=flush left, text=csInk
+  },
+  cpu/.style={stage, draw=csCPU},
+  gpu/.style={stage, draw=csGPU},
+  %
+  gate/.style={
+    draw=csGate, fill=white, text=csGate, line width=0.6pt,
+    rounded corners=1pt, inner xsep=3pt, inner ysep=1.8pt,
+    font=\sffamily\tiny\bfseries
+  },
+  %
+  repo/.style={
+    draw=csHub, fill=white, text=csInk, line width=0.6pt,
+    rounded corners=2pt, inner sep=4pt, text width=30mm,
+    align=center, font=\sffamily\tiny
+  },
+  result/.style={
+    draw=csCPU, fill=white, text=csInk, line width=0.6pt,
+    rounded corners=2pt, inner sep=4pt, text width=30mm,
+    align=center, font=\sffamily\tiny
+  },
+  %
+  flow/.style={->, line width=1pt, draw=csGrey},
+  bus/.style ={<->, line width=0.7pt, draw=csHub, dashed, dash pattern=on 1.4pt off 1.4pt}
+]
+
+% =====================================================================
+%  Stage row
+% =====================================================================
+\node[cpu] (s0) {%
+  {\bfseries\color{csCPU} PHASE 0\quad Data preparation}\\[1.5pt]
+  {\tiny\color{csGrey} local $\cdot$ CPU}\\[3pt]
+  OpenSLR 104 (MUCS)\\
+  {\tiny 89.8\,h train (text only) $\cdot$ 5.2\,h test}\\
+  Common Voice 17 {\tiny (streamed)}\\[2.5pt]
+  {\tiny\ttfamily prepare\_mucs $\cdot$ prepare\_cv}
+};
+
+\node[gpu, right=9mm of s0] (s1) {%
+  {\bfseries\color{csGPU} PHASE 1\quad Text generation}\\[1.5pt]
+  {\tiny\color{csGrey} Kaggle $\cdot$ GPU $\cdot$ nb 01a}\\[3pt]
+  Gemma\,4 26B-A4B {\tiny (llama.cpp)}\\[2.5pt]
+  {\tiny\ttfamily gen\_bigrams $\rightarrow$ filter\_bigrams\\
+   \phantom{x}$\rightarrow$ gen\_sentences}\\[2pt]
+  {\tiny 15k calls $\rightarrow$ 6{,}114 bigrams\\ $\rightarrow$ 18{,}054 sentences}
+};
+
+\node[gpu, right=9mm of s1] (s2) {%
+  {\bfseries\color{csGPU} PHASE 2\quad Voice synthesis}\\[1.5pt]
+  {\tiny\color{csGrey} Kaggle $\cdot$ GPU $\cdot$ nb 01b}\\[3pt]
+  Indic Parler-TTS\\
+  {\tiny 2 voices, sharded + resumable}\\[2.5pt]
+  {\tiny\ttfamily synthesize $\cdot$ make\_subset}\\[2pt]
+  {\tiny 18{,}010 clips / 23.95\,h\\ Train\_T1 $\subset$ Train\_T2}
+};
+
+\node[gpu, right=9mm of s2] (s3) {%
+  {\bfseries\color{csGPU} PHASE 3\quad Fine-tuning}\\[1.5pt]
+  {\tiny\color{csGrey} Kaggle $\cdot$ GPU $\cdot$ nb 02}\\[3pt]
+  whisper-base, full FT\\
+  {\tiny AdamW, lr 2e-5, eff.\ batch 64}\\[2.5pt]
+  {\tiny\ttfamily train\_whisper}\\[2pt]
+  {\tiny M6 (T1 8\,h) $\cdot$ M7 (T2 24\,h)\\ M8 (T2 + CV mono)}
+};
+
+\node[gpu, right=9mm of s3] (s4) {%
+  {\bfseries\color{csGPU} PHASE 4\quad Evaluation}\\[1.5pt]
+  {\tiny\color{csGrey} Kaggle GPU + local CPU $\cdot$ nb 03}\\[3pt]
+  faster-whisper {\tiny (CTranslate2)}\\
+  {\tiny recording-level, \texttt{language=None}}\\[2.5pt]
+  {\tiny\ttfamily decode $\cdot$ score}\\[2pt]
+  {\tiny MER (hybrid) + CBA (HE/EH)}
+};
+
+% ---- horizontal flow ------------------------------------------------
+\draw[flow] (s0) -- (s1);
+\draw[flow] (s1) -- (s2);
+\draw[flow] (s2) -- (s3);
+\draw[flow] (s3) -- (s4);
+
+% =====================================================================
+%  Gates (above the stages)
+% =====================================================================
+\node[gate, above=3mm of s0] (g0) {GATE 0\quad\mdseries Table 1 counts};
+\node[gate, above=3mm of s1] (g1) {GATE 1 + 1.5\quad\mdseries yield, audit};
+\node[gate, above=3mm of s2] (g2) {GATE 2 + 2b\quad\mdseries subset, join};
+\node[gate, above=3mm of s4] (g3) {GATE 3\quad\mdseries calibration};
+
+\node[above=2.5mm of g3, font=\sffamily\tiny\itshape, text=csGate, align=center]
+  {large-v2 zero-shot $\approx$ 52.0 MER\\ run \emph{before} generating anything};
+
+% =====================================================================
+%  Hugging Face Hub -- the data bus
+% =====================================================================
+\node[repo, below=17mm of s0] (r0) {%
+  \textbf{\ttfamily mucs-he-cs}\\
+  train\_text $\cdot$ dev $\cdot$ test\\ cv\_hi $\cdot$ cv\_en};
+
+\node[repo, below=17mm of s1] (r1) {%
+  \textbf{\ttfamily hi-en-synth-cs}\\
+  bigrams $\cdot$ sentences\\ \textit{(text)}};
+
+\node[repo, below=17mm of s2] (r2) {%
+  \textbf{\ttfamily hi-en-synth-cs}\\
+  synth\_t2 $\cdot$ t1\_ids.json\\ \textit{(audio, FLAC)}};
+
+\node[repo, below=17mm of s3] (r3) {%
+  \textbf{\ttfamily whisper-base-cs-m\{6,7,8\}}\\
+  \textbf{\ttfamily csasr-train-checkpoints}\\ \textit{(resume state)}};
+
+\node[result, below=17mm of s4] (r4) {%
+  \textbf{\ttfamily results/table2}\\
+  MER $\cdot$ CBA-HE $\cdot$ CBA-EH\\ \textit{(local CPU)}};
+
+% band behind the Hub repos only (r4 is a local artefact, kept outside)
+\begin{scope}[on background layer]
+  \node[draw=csHub, fill=csHubFill, rounded corners=3pt, line width=0.9pt,
+        fit=(r0)(r3), inner sep=7pt] (hubbox) {};
+\end{scope}
+
+\node[anchor=south west, font=\sffamily\scriptsize\bfseries, text=csHub]
+  at ([xshift=1pt]hubbox.north west)
+  {HUGGING FACE HUB\quad\mdseries\itshape the only contract between stages};
+
+% ---- stage <-> hub links --------------------------------------------
+\draw[bus] (s0.south) -- (s0.south |- hubbox.north);
+\draw[bus] (s1.south) -- (s1.south |- hubbox.north);
+\draw[bus] (s2.south) -- (s2.south |- hubbox.north);
+\draw[bus] (s3.south) -- (s3.south |- hubbox.north);
+\draw[bus] (s4.south) -- (r4.north);
+
+% =====================================================================
+%  Footnotes
+% =====================================================================
+\node[anchor=north west, font=\sffamily\tiny, text=csGrey,
+      align=flush left, text width=200mm]
+  at ([yshift=-5mm]hubbox.south west)
+  {%
+   \textbf{Environment split.} Phases 1 and 2 are separate notebooks by necessity:
+   \texttt{parler-tts} pins \texttt{transformers==4.46.1} while Gemma\,4 needs
+   $\ge$\,5.5 --- they cannot share a process, so the Hub is the checkpoint between them.
+   Every stage reads a manifest and writes a manifest; no stage passes a live object to another.\\[2pt]
+   \textbf{Key deviations from the paper.}
+   \textbf{D1} LLM 70B $\rightarrow$ 26B-A4B MoE $\cdot$
+   \textbf{D2/D15} large-v2 $\rightarrow$ whisper-base, 5000 $\rightarrow$ 800 steps (primary confound) $\cdot$
+   \textbf{D4/D8} WhisperX $\rightarrow$ faster-whisper, recording-level $\cdot$
+   \textbf{D14} insertional $\rightarrow$ alternational code-switching.
+   Full table: \texttt{README.md}; derivations: \texttt{docs/LEARNING-GUIDE.md}.%
+  };
+
+\end{tikzpicture}
+\end{document}
