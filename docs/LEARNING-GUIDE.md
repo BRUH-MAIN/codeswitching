@@ -387,6 +387,69 @@ The four presets:
 
 ## 5. The metrics: MER and CBA
 
+### 5.0 "Reference" and "hypothesis" — the two words everything is phrased in
+
+Every metric below compares two strings, and the field has fixed names for
+them:
+
+* **Reference** (`ref`) — the **ground truth**. What was actually said,
+  according to the corpus's human transcript. In this project it comes from
+  MUCS's Kaldi `text` file.
+* **Hypothesis** (`hyp`) — **what the ASR model output**. The transcript the
+  model produced for that same audio.
+
+**Why "hypothesis" and not just "output"?** Because a speech decoder does not
+produce *one* answer — it searches over many possible transcripts and scores
+them. Each candidate is literally a *hypothesis about what was said*. Beam
+search ([10.2](#102-the-decoding-heuristics)) maintains `beam_size=5` of them
+simultaneously and returns the highest-scoring one. The name is a leftover
+from that search framing, and it stuck even when only the winner is reported.
+
+The distinction is load-bearing across this codebase:
+
+| | Reference | Hypothesis |
+|---|---|---|
+| Field name | `text` | `hyp` |
+| File | `refs_utt.jsonl` | `hyp_m6.jsonl`, `hyp_largev2_zeroshot.jsonl` … |
+| Produced by | humans (the corpus) | `decode.py` |
+| Role in MER | the denominator `N` | supplies `S`, `D`, `I` |
+| Role in CBA | supplies the denominator | supplies the numerator |
+
+Note the asymmetry: **the reference always defines the denominator.** MER is
+errors *per reference unit*; CBA is matched switch bigrams *per reference
+switch bigram*. A model cannot improve either score by producing more output
+— only by matching the reference better.
+
+A real pair from this project (`whisper-large-v2` zero-shot, recording
+`406yMKxIdSDHRf8H`):
+
+```
+REFERENCE : लिबर ऑफिस impress पर slide master और slide design के इस spoken
+            tutorial में आपका स्वागत है …
+
+HYPOTHESIS: LibreOffice Impress पर स्लाइड मास्टर और स्लाइड डिजाइन के लिए इस
+            spoken tutorial में आपका स्वागत है। …
+```
+
+Read those two carefully — the whole project is visible in the diff. The
+reference writes `slide master` in **Latin**; the model transliterated it to
+`स्लाइड मास्टर` in **Devanagari**. Measured over this single recording:
+
+```
+reference HE switch bigrams : 226 tokens / 173 types
+  matched adjacently        :  38
+  missed                    : 135
+
+matched : इस spoken · इस tutorial · अपने operating · में gnu · हैं background
+missed  : ऑफिस impress · पर slide · और slide · कि slides · लिए backgrounds
+```
+
+Every "missed" pair failed for the same reason: the English half was
+transliterated, so the script boundary that *defines* the switch point
+vanished. This is the exact failure mode
+[Part 2](#2-foundations-code-switching) predicts and that fine-tuning is
+meant to fix.
+
 ### 5.1 Edit distance, the foundation of both error rates
 
 ASR accuracy is measured by **Levenshtein (edit) distance** — the minimum
@@ -707,12 +770,198 @@ one language.
 its own translation (`दस्तावेज़ document` — Hindi "document" followed by
 English "document"). Such a pair is not a real code-switch, it is a gloss.
 
-This uses **self-consistency**: sample the judge 3× at temperature 0.7 and
-take a majority vote, because a smaller judge is noisier than the paper's
-70B. Unparseable or tied votes **keep** the bigram — never silently drop
-data.
+#### "Sampling the judge 3×" — what that actually means
 
-### 7.4 Validation of generated sentences
+Three terms are bundled in that phrase, so unpack them in order.
+
+**"Judge"** — *LLM-as-a-judge*: using a language model as a **classifier**
+rather than a generator. We are not asking it to write anything; we hand it
+20 word pairs and ask for a YES/NO per pair:
+
+```
+system: You judge whether a Hindi word and an English word are direct
+        translations of each other. Answer '<number>: YES' … or '<number>: NO'.
+user:   1. दस्तावेज़ / document
+        2. नया / document
+        …
+```
+
+**"Sampling"** — the model is run at `temperature=0.7`, which makes it
+**non-deterministic**. Temperature `T` rescales the logits before the softmax
+that picks the next token:
+
+```
+P(token_i) = exp(z_i / T) / Σ_j exp(z_j / T)
+```
+
+* `T → 0` — the distribution collapses onto the single highest-scoring token;
+  output becomes deterministic (greedy).
+* `T = 1` — the model's own unmodified distribution.
+* `T > 1` — flatter, more random.
+
+At `T = 0.7` the same prompt can genuinely yield different verdicts on
+different runs. That variability is the point, not a defect.
+
+**"3×"** — we therefore ask the **same question three separate times** and
+take a **majority vote**. This is called **self-consistency**: a single
+sample from a noisy classifier is a noisy estimate; the mode of several
+samples is a better one. The paper's 70B judge is confident enough not to
+need this; a much smaller model is not.
+
+The decision rule is literally `is_translation = votes[True] > votes[False]`,
+which has a deliberate asymmetry — **ties and unparseable output keep the
+bigram**:
+
+```
+दस्तावेज़ document   YES=3 NO=0  ->  REJECT   (all three agree: a gloss)
+फ़ाइल file          YES=2 NO=1  ->  REJECT   (majority)
+noisy, minority YES  YES=1 NO=2  ->  KEEP     (majority says it's fine)
+नया document        YES=0 NO=3  ->  KEEP
+unparseable output   YES=0 NO=0  ->  KEEP     (never silently drop data)
+```
+
+**One implementation subtlety that makes or breaks this.** Every LLM call is
+cached ([7.8](#78-resumability--cachepy)), and the cache key includes a
+`sample_idx`:
+
+```python
+ResponseCache.key(model_id, messages, params, sample_idx)   # sample_idx = 0, 1, 2
+```
+
+Without `sample_idx` in the key, all three "samples" would be the *same
+cache entry* — the cache would return one stored answer three times, the vote
+would be unanimous by construction, and self-consistency would silently
+degrade into a single sample doing three times the bookkeeping.
+
+### 7.4 What the LLM actually produced
+
+Real examples, pulled from `sentences_15k.jsonl` (the corpus that trained
+M6/M7/M8). 18,054 sentences over 5,387 distinct bigrams.
+
+**Bigrams — Hindi→English (HE), 5,304 of them:**
+
+```
+अंक decimal        अंतिम balance      अंतिम document     अंतिम file
+अंकीय selection    अंतिम bullet       अंतिम field        अंतिम footer
+अंत final          अंतिम deadline     अंतिम digit        अंतिम graphs
+अंत tutorial       अंतिम decision     अंतिम index        बुनियादी formatting
+```
+
+**Bigrams — English→Hindi (EH), only 83:**
+
+```
+Account बनाना      Option पर          URL पर             argument जोड़ें
+Checked नहीं       Search करें        Video देखें        array घोषित
+Content को         Time के            application शामिल  case में
+Mode का            Toolbar नीचे       checked में
+```
+
+**Note the 5,304 : 83 skew.** `script_filter()` returns the **first**
+script-crossing pair it finds, and the paper's prompt seeds Hindi-first
+examples (`प्रस्तुति document`), so HE dominates overwhelmingly. This is a
+measured property of our pipeline the paper does not discuss — and it is
+worth knowing when reading CBA-EH, which is trained on far thinner coverage
+than CBA-HE.
+
+**Sentences.** The prompt asks for four per bigram — two English-matrix, two
+Hindi-matrix. 3,569 bigrams kept all four. A complete set:
+
+```
+bigram: बुनियादी formatting
+  [en] Please ensure you follow the बुनियादी formatting rules while creating the document.
+  [en] You need to master the बुनियादी formatting of this software before moving to advanced levels.
+  [hi] इस डॉक्यूमेंट में बुनियादी formatting का ध्यान रखना बहुत ज़रूरी है।
+  [hi] क्या आप मुझे इस फाइल की बुनियादी formatting समझा सकते हैं?
+
+bigram: नया document
+  [en] Please create a नया document for the client before the meeting starts.
+  [en] I cannot find the नया document you sent me via email.
+  [hi] कृपया इस प्रोजेक्ट के लिए एक नया document तैयार करें।
+  [hi] क्या आप मुझे वह नया document भेज सकते हैं?
+```
+
+Look at the `[en]` rows and you can *see* D14 happening: `"Please ensure you
+follow the … rules while creating the document"` is a fully English clause
+with one Hindi word inserted. Real MUCS is the mirror image — a Hindi frame
+with English technical terms. The 50/50 matrix split the prompt demands is
+exactly what produces this.
+
+### 7.5 How duplicates are detected
+
+The LLM repeats itself heavily, so deduplication happens at **four** distinct
+layers. All four are *exact-match*, which matters — see the limitation below.
+
+**Layer 0 — the response cache (deduplicates API calls, not content).**
+[`cache.py`](../src/csasr/llm/cache.py) keys each request on a SHA-256 of
+`(model, messages, sampling params, sample_index)`. This prevents re-paying
+for a call already made; it does nothing about two *different* calls
+returning the same bigram.
+
+**Layer 1 — raw bigram strings.** `filter_bigrams.py`:
+
+```python
+unique = sorted(set(raw))       # 44,657 raw -> 5,932 unique in the paper (13.3%)
+```
+
+**Layer 2 — post-extraction collision.** Because
+[D9](#73-filtering--filter_bigramspy) *extracts* the switch pair from a
+longer phrase, two different phrases collapse to the same pair:
+
+```
+"बुनियादी formatting basics"  ─┐
+                               ├─►  बुनियादी formatting   (one bigram, not two)
+"बुनियादी formatting rules"   ─┘
+```
+
+A second `seen` set catches this *after* extraction. Without it the two would
+survive Layer 1 (different strings) and produce duplicate sentence sets.
+
+**Layer 3 — sentences, content-addressed by SHA-1.**
+
+```python
+def _sent_id(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+```
+
+The id **is** a hash of the content, so identical text necessarily produces
+an identical id and the second copy is dropped. Verified on the real corpus:
+18,054 sentences → 18,054 distinct `sent_id` → 18,054 distinct texts.
+
+```
+text    : क्या आप मुझे वह नया document भेज सकते हैं?
+sha1    : c00d8d80bdc7bb1d911144df8f56c834ef388d78
+sent_id : c00d8d80bdc7bb1d          (first 16 hex chars)
+```
+
+**Why SHA-1 and not Python's `hash()`** — the same reason as speaker
+assignment ([8.2](#82-description-conditioned-tts)), but with higher stakes:
+`sent_id` becomes the **audio filename** (`{sent_id}.wav`). `hash()` is
+salted per process, so a resumed TTS run would compute different ids for the
+same sentences, fail to recognise already-synthesized clips, and regenerate
+the entire corpus under new names. Content-addressing is what makes
+[Phase 2](#8-phase-2--tts-voice-synthesis) resumable at all.
+
+**Layer 4 — re-dedup after cleaning.** `fix_sentences.py` strips the
+`"English: "` labels ([7.6](#77-the-label-leak-bug--fix_sentencespy)), which
+can make two previously-distinct sentences identical:
+
+```
+"English: Save the file को"  ─┐
+                              ├─►  "Save the file को"   (now duplicates)
+"Save the file को"           ─┘
+```
+
+so it re-runs dedup on the cleaned text.
+
+**The limitation worth stating.** Every layer is exact string matching.
+**Near-duplicates are not caught** — `नया document बनाएं` and `नया document
+बनाइए` are semantically the same sentence and both survive. This is visible
+in [D13](#79-the-distribution-problems): dedup survival *falls* as you scale
+(7.7% → 4.8%), and 3.4× the calls bought only 2.1× the unique bigrams. The
+model is running out of genuinely new ideas long before it runs out of
+distinct strings.
+
+### 7.6 Validation of generated sentences
 
 Every returned sentence must (a) contain the bigram as *adjacent* tokens and
 (b) carry both scripts. Sentences failing either are discarded, reproducing
@@ -721,7 +970,7 @@ the paper's own shortfall honestly rather than padding counts.
 `matrix_lang()` assigns the sentence's matrix language by **word-count
 majority**, not by trusting the model's own labelling of its output.
 
-### 7.5 The label-leak bug — [`fix_sentences.py`](../src/csasr/llm/fix_sentences.py)
+### 7.7 The label-leak bug — [`fix_sentences.py`](../src/csasr/llm/fix_sentences.py)
 
 Worth studying as a category of failure. Gemma prefixes many sentences with
 a literal matrix-language label:
@@ -737,7 +986,7 @@ speech. `fix_sentences.py` re-cleans an already-generated corpus in place
 (strip label, re-validate against the bigram, recompute matrix language,
 dedup) in seconds rather than re-running hours of generation.
 
-### 7.6 Resumability — [`cache.py`](../src/csasr/llm/cache.py)
+### 7.8 Resumability — [`cache.py`](../src/csasr/llm/cache.py)
 
 Every LLM request is hashed on `(model, messages, sampling params, sample
 index)` and its response appended to a JSONL the instant it returns. A
@@ -747,7 +996,7 @@ This is the single mechanism that makes an 8–12h generation run survivable
 on a platform that kills sessions at 12 hours. **A stage that cannot resume
 cannot finish.**
 
-### 7.7 The distribution problems
+### 7.9 The distribution problems
 
 These are the most intellectually interesting deviations in the project,
 because they are *measured negative results*.
@@ -1379,10 +1628,17 @@ Use these to check your understanding. Each links back to the relevant part.
 3. Why does a 4-second clip cost the same encoder compute as a 30-second one? → [3.1](#31-audio--log-mel-spectrogram)
 
 **Metrics**
+3b. What is a "hypothesis", why is it called that, and why does the *reference* always define the denominator? → [5.0](#50-reference-and-hypothesis--the-two-words-everything-is-phrased-in)
 4. Write the MER formula. Why can it exceed 100%? → [5.2](#52-wer--mer)
 5. Why does CBA need multiset rather than set semantics? → [5.3](#53-cba--code-switch-bigram-accuracy)
 6. Two hypotheses have identical MER but very different CBA. How? → [5.3](#53-cba--code-switch-bigram-accuracy) + [2](#2-foundations-code-switching)
 7. Why is CBA's denominator taken per-utterance when we decode per-recording? → [5.3b](#53-cba--code-switch-bigram-accuracy)
+
+**LLM generation**
+7a. Name the four layers at which duplicates are removed, and what each one catches that the previous misses. → [7.5](#75-how-duplicates-are-detected)
+7b. What kind of duplicate does *none* of them catch, and where does that show up in the numbers? → [7.5](#75-how-duplicates-are-detected) + [D13](#79-the-distribution-problems)
+7c. What does "sample the judge 3×" mean? What would break if `sample_idx` were left out of the cache key? → [7.3](#73-filtering--filter_bigramspy)
+7d. Why are there 5,304 HE bigrams but only 83 EH? → [7.4](#74-what-the-llm-actually-produced)
 
 **Traps**
 8. What does `BasicTextNormalizer` do to `दस्तावेज़`, and why does it matter? → [4.2](#42-normalization--srccsasrnormalizepy)
