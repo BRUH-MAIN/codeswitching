@@ -4,6 +4,14 @@ Replication of **Track 2** of Biswas et al., *"Adapting Whisper for low-resource
 Hindi-English Code-Mix speech with on-the-fly Augmentation & LLM-Synthesised Data"*
 (Interspeech 2025). [`paper/biswas25_interspeech.pdf`](paper/biswas25_interspeech.pdf)
 
+Three documents, three jobs:
+
+* **This README** — the lab notebook: results, deviations, and gotchas as they were found.
+* [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the map: what each module does.
+* [`docs/LEARNING-GUIDE.md`](docs/LEARNING-GUIDE.md) — **the tutorial**: concepts,
+  formulae, and every term defined from scratch. Start here if you want to be able
+  to explain the whole project.
+
 Track 2's claim: **you do not need real code-switched training audio.** An LLM
 few-shot-prompted for Hindi-English bigrams, expanded into sentences and voiced
 by a TTS model, is enough to adapt Whisper to a code-switching domain.
@@ -28,7 +36,7 @@ Common Voice ─┘   (text-only train,                                  (train_
  (streamed)        4h dev, 5.2h test)                                 dev, test,
                                                                       cv_hi, cv_en)
                                           01a_generate_text.ipynb          │
-                                          │  transformers>=4.50 + Gemma-3-4B│
+                                          │  llama.cpp + Gemma-4-26B-A4B    │
                                           ├─ gen_bigrams                    │
                                           ├─ filter_bigrams                │
                                           └─ gen_sentences ─► GATE 1 ──────┼─► hi-en-synth-cs
@@ -39,7 +47,8 @@ Common Voice ─┘   (text-only train,                                  (train_
                                           └─ make_subset   ─► GATE 2 ──► hi-en-synth-cs
                                                                        (synth_t2,
                                           02_train.ipynb                t1_ids.json)
-                                          └─ whisper-small full FT ──► whisper-small-cs-m{6,7,8}
+                                          └─ whisper-base full FT ───► whisper-base-cs-m{6,7,8}
+                                             (D15: was whisper-small)
 
                                           03_eval.ipynb
                                           ├─ GATE 3 (large-v2 zero-shot ≈ 52.0 MER)
@@ -362,15 +371,80 @@ a log, revoke it at [hf.co/settings/tokens](https://huggingface.co/settings/toke
 | **D13** | 4,466 bigram calls | **15,000** | The 26B repeats itself: 4,466 calls gave only **3,458 unique** bigrams vs the paper's 5,932. **Resolved** — at 15,000 calls every Gate 1 figure now *exceeds* the paper: 7,219 unique (vs 5,932), 6,114 valid (vs 5,477), 18,054 sentences (vs 16,000), ~25.1h (vs 22h). Dedup survival still falls with scale (7.7% → 4.8%), i.e. sub-linear returns: 3.4× the calls bought 2.1× the unique bigrams. Cost ~6h26m from a cold cache. |
 | **D14** | Insertional CS (Hindi frame, English terms) | **Alternational CS** (English clauses alternating with Hindi) | The sharpest form of D11, and *faithful to the paper's own prompt*. Real MUCS is **88% Hindi-matrix**, mean English run **1.70 words**, **7%** of English runs ≥4 words. Ours is **58.5% Hindi-matrix**, mean English run **3.92 words**, **48.2%** ≥4 words. But §3.2.2's prompt explicitly orders *"Make 2 sentences with English as the main language and 2 sentences with Hindi as the main language"* — a 50/50 split, against the paper's own 88/12 test set. We follow the prompt verbatim, so the mismatch is inherited, not introduced. Measured by [`scripts/grammar_probe.py`](scripts/grammar_probe.py). Expected to cost absolute MER (Whisper's decoder is an LM, and we train it on the wrong register) while leaving the M6→M7→M8 *ordering* intact. **Leading suspect if M6/M7 underperform.** |
 | **D9** | LLM obeys "a couple of words" | **We extract the switch pair from longer phrases** | The paper's 70B emitted true bigrams. Gemma 4 reliably appends a third word (`बुनियादी formatting basics`). Demanding exactly two tokens threw away **10/10** of a real Gemma-4 sample even though **8** carried a valid switch point. The *prompt* stays verbatim; only `script_filter` is more forgiving. `--strict-bigrams` restores the paper-faithful behaviour. |
+| **D15** | whisper-small, 5,000 steps, eval/250, patience 4 | **whisper-base (74M), 800 steps, eval/200, patience 3** | Kaggle's free tier is a **~6h/day** allowance, not the 30h/week pool assumed — measured off its own quota API mid-project — against a hard deadline. **This is the primary confound in our results.** Capping *steps* while dataset size grows means epochs-seen falls with more data: M6 saw its data **16.7×**, M7 **5.7×**, M8 only **2.9×** (logged epochs, effective batch 128). The model the paper says should be *best* got the least exposure per example, so the run does not isolate the variable it intends to. Revert via `MODEL`/`MAX_STEPS` in `02_train.ipynb`; nothing in `src/` needs changing. |
 
 D1 and D2 both cost quality, so **absolute MER will not match Table 2**. The claim
-under test is the **ordering and relative gains**: `zero-shot > M6 > M7 > M8`.
+under test was the **ordering and relative gains**: `zero-shot > M6 > M7 > M8`.
+**That ordering did not reproduce** — see [Results](#results-what-actually-happened)
+below, and D15 for why the run was underpowered to test it.
 
 Also note: the paper's few-shot examples were mangled by PDF extraction into
 `pr-tEt document; bEnyAdF formatting; isspoken`. All three are recoverable verbatim
 from the first line of the MUCS test transcripts — `pr-tEt` is **प्रस्तुति**
 ("presentation"), which occurs in the corpus, not प्रतीत, which never does. See
 [`prompts.py`](src/csasr/llm/prompts.py).
+
+---
+
+## Results: what actually happened
+
+Real MUCS test set, recording-level decoding, `hybrid` MER, `adjacent` CBA —
+every system scored identically.
+
+```
+system                   MER   paper   CBA-HE   CBA-EH
+large-v2 zero-shot      51.9    52.0     20.1     17.6     <- GATE 3, calibration
+base zero-shot          95.2       -      0.0      0.0     <- our actual baseline
+M6 (T1, 8h)             56.8    48.2      7.1     17.0
+M7 (T2, 22h)            57.2    40.8      6.9     15.3
+M8 (T2 + mono)          60.6    39.2      1.0      3.0
+
+M6 > M7 > M8 ordering reproduced: False
+```
+
+**What reproduced.** Gate 3 lands on **51.9 against the paper's 52.0** (and
+CBA-HE `lenient` 43.8 vs 42.9), so decoding, normalization, word-level LID
+and both metrics are all validated against a published number. The
+measuring instrument is sound; these numbers are real.
+
+**What synthetic data demonstrably bought us.** `whisper-base` zero-shot
+scores **95.2 MER / 0.0 CBA** — it transliterates everything into Devanagari
+and produces no script boundary at all, so not a single switch bigram can
+match. Every fine-tuned model is dramatically better (56.8–60.6 MER, non-zero
+CBA). **Training on LLM+TTS synthetic audio clearly taught the model to emit
+mixed-script code-switched output.** That much of Track 2's claim held.
+
+**What did not reproduce.** The M6→M7→M8 ordering inverted: MER got *worse*
+with more data (56.8 → 57.2 → 60.6).
+
+**Why — the leading explanation is D15, not the paper's idea.** The 800-step
+cap was fixed while dataset size grew ~6×, so epochs-seen fell as data grew:
+
+| | clips | logged epochs @ eff. batch 128 |
+|---|---|---|
+| M6 | 6,069 | **16.67** |
+| M7 | 18,010 | **5.68** |
+| M8 | ~35,069 | **2.92** |
+
+The model that should be best got ~6× less exposure per example than the
+model it had to beat. "More data" was confounded with "less training on it",
+so this run does not isolate the variable it intends to test.
+
+M8's CBA collapse (7.1/17.0 → 1.0/3.0) is sharper than MER alone explains:
+it adds ~27h of **monolingual** Common Voice into a 800-step budget, so a
+large share of a fixed budget goes to examples containing no code-switching
+at all — diluting exposure to precisely what CBA measures.
+
+Secondary suspects, both pre-registered above before results existed: **D14**
+(we trained Whisper's decoder-as-LM on the wrong register) and **D2**
+(whisper-base is 20× smaller than the paper's large-v2 and may lack the
+capacity to exploit more data at all).
+
+**To make this a fair test:** cap by *epochs* rather than steps (or scale
+steps with dataset size), restore whisper-small or larger, then optionally
+address D14 and ablate M8's monolingual share. None of this makes the paper
+wrong — it makes **our run underpowered to test it**, which is the honest
+and more useful thing to report.
 
 ---
 
