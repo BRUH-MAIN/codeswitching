@@ -37,6 +37,11 @@ fi
 cd "$REPO"
 echo "[repo] $REPO"
 
+# See train_a100.sh: $PY has no reason to already have csasr on it, and this
+# also picks up local code changes since the checkpoints were trained.
+echo "[install] $PY -m pip install -e .[decode]"
+$PY -m pip install -q -e ".[decode]"
+
 # Must match what train_a100.sh used, or the checkpoints will not be found.
 : "${WORKDIR:=${SLURM_SUBMIT_DIR:-$PWD}/csasr-work}"
 : "${HF_HOME:=$WORKDIR/hf}"

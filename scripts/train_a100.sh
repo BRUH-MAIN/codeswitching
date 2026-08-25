@@ -52,6 +52,16 @@ fi
 cd "$REPO"
 echo "[repo] $REPO"
 
+# ---- make sure this checkout is importable ---------------------------------
+# sbatch's $PY has no reason to already have csasr on it -- there is no venv
+# activation or module load here, just whatever python3 resolves to on the
+# node. Editable install also picks up local code changes, unlike Kaggle's
+# `pip install git+...`, which silently skips a reinstall once the version is
+# "satisfied" (see README). Without this the job dies ~10s in on
+# `import csasr` after already having reserved the GPU for hours.
+echo "[install] $PY -m pip install -e .[train]"
+$PY -m pip install -q -e ".[train]"
+
 # ---- where the big files go ------------------------------------------------
 # This needs ~60 GB and it must NOT be a quota'd home directory:
 #   parquet download   ~5 GB
