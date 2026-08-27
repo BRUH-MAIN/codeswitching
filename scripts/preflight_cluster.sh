@@ -57,8 +57,25 @@ command -v quota >/dev/null && { echo "  quota:"; quota -s 2>/dev/null | sed 's/
 
 echo ""
 echo "---- python / package ---------------------------------------"
-PY=${PYTHON:-python3}
+# See train_a100.sh: the system python3 has no pip (ensurepip is disabled for
+# it on Debian/Ubuntu), so default to the conda module's python, which does.
+CONDA_PY=/dist_home/common-apps/conda/bin/python3
+if [[ -n "${PYTHON:-}" ]]; then
+    PY=$PYTHON
+elif [[ -x "$CONDA_PY" ]]; then
+    PY=$CONDA_PY
+else
+    PY=python3
+fi
 echo "  interpreter: $(command -v $PY)  ($($PY --version 2>&1))"
+if $PY -m pip --version >/dev/null 2>&1; then
+    echo "  ok   pip             $($PY -m pip --version 2>&1 | cut -d' ' -f2)"
+else
+    echo "  MISSING pip -- '$PY -m pip install ...' will fail with 'No module named pip'."
+    echo "           (Debian/Ubuntu disables ensurepip for the system python, so"
+    echo "            'python3 -m ensurepip --version' misleadingly still prints a"
+    echo "            version. Fix: use the conda module's python, or PYTHON=...)"
+fi
 $PY - <<'PY'
 import importlib, sys
 

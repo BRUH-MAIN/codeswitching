@@ -1,0 +1,3 @@
+[repo] /dist_home/d_palmani/c-08/codeswitching
+[install] python3 -m pip install -e .[train]
+/usr/bin/python3: No module named pip

@@ -25,7 +25,17 @@
 
 set -euo pipefail
 
-PY=${PYTHON:-python3}
+
+# See train_a100.sh: the system python3 has no pip (ensurepip is disabled for
+# it on Debian/Ubuntu), so default to the conda module's python, which does.
+CONDA_PY=/dist_home/common-apps/conda/bin/python3
+if [[ -n "${PYTHON:-}" ]]; then
+    PY=$PYTHON
+elif [[ -x "$CONDA_PY" ]]; then
+    PY=$CONDA_PY
+else
+    PY=python3
+fi
 
 # sbatch runs a COPY of this script from the spool dir, so BASH_SOURCE does not
 # locate the checkout. $SLURM_SUBMIT_DIR does. See train_a100.sh for the detail.

@@ -28,7 +28,21 @@
 
 set -euo pipefail
 
-PY=${PYTHON:-python3}          # the site template calls python3, not python
+# The site's system python3 is Ubuntu's, which ships without pip -- and
+# Debian/Ubuntu patches `ensurepip` to refuse to bootstrap it for the system
+# interpreter ("ensurepip is disabled for the system python"), so `python3 -m
+# pip install ...` below just dies with "No module named pip". There is no
+# self-service fix short of `apt install python3-pip`, which needs root and
+# nobody has here. The `conda` module's python already has a working pip, so
+# default to that unless the caller pins PYTHON explicitly.
+CONDA_PY=/dist_home/common-apps/conda/bin/python3
+if [[ -n "${PYTHON:-}" ]]; then
+    PY=$PYTHON
+elif [[ -x "$CONDA_PY" ]]; then
+    PY=$CONDA_PY
+else
+    PY=python3
+fi
 
 # ---- locate the repo -------------------------------------------------------
 # sbatch COPIES this script to /var/spool/slurmd/job*/slurm_script and runs it
