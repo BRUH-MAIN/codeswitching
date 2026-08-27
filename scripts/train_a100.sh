@@ -44,6 +44,15 @@ else
     PY=python3
 fi
 
+# This is a pure PyTorch codebase -- csasr never imports TensorFlow or Flax.
+# But `transformers` defaults to USE_TF=AUTO and probes for TF at import time
+# regardless of whether we use it, and the conda base env's TensorFlow (Keras
+# 3) is incompatible with transformers' TF integration code, so importing
+# Seq2SeqTrainer crashes on an unrelated backend we never asked for. Telling
+# transformers not to bother avoids the conflict entirely.
+export USE_TF=0
+export USE_FLAX=0
+
 # ---- locate the repo -------------------------------------------------------
 # sbatch COPIES this script to /var/spool/slurmd/job*/slurm_script and runs it
 # from there, so "${BASH_SOURCE[0]}" points at the spool copy, not the checkout.

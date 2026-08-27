@@ -25,7 +25,6 @@
 
 set -euo pipefail
 
-
 # See train_a100.sh: the system python3 has no pip (ensurepip is disabled for
 # it on Debian/Ubuntu), so default to the conda module's python, which does.
 CONDA_PY=/dist_home/common-apps/conda/bin/python3
@@ -36,6 +35,15 @@ elif [[ -x "$CONDA_PY" ]]; then
 else
     PY=python3
 fi
+
+# This is a pure PyTorch codebase -- csasr never imports TensorFlow or Flax.
+# But `transformers` defaults to USE_TF=AUTO and probes for TF at import time
+# regardless of whether we use it, and the conda base env's TensorFlow (Keras
+# 3) is incompatible with transformers' TF integration code, so importing
+# Seq2SeqTrainer crashes on an unrelated backend we never asked for. Telling
+# transformers not to bother avoids the conflict entirely.
+export USE_TF=0
+export USE_FLAX=0
 
 # sbatch runs a COPY of this script from the spool dir, so BASH_SOURCE does not
 # locate the checkout. $SLURM_SUBMIT_DIR does. See train_a100.sh for the detail.
