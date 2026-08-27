@@ -20,7 +20,7 @@
 
 #SBATCH --job-name=csasr-t2
 #SBATCH --partition=workq
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
@@ -52,6 +52,11 @@ fi
 # transformers not to bother avoids the conflict entirely.
 export USE_TF=0
 export USE_FLAX=0
+
+# Under sbatch stdout is fully buffered (not line-buffered like a tty), so log
+# lines pile up in memory instead of landing in the .out file as they happen --
+# `tail -f` on the log would look stalled even while training runs fine.
+export PYTHONUNBUFFERED=1
 
 # ---- locate the repo -------------------------------------------------------
 # sbatch COPIES this script to /var/spool/slurmd/job*/slurm_script and runs it
@@ -150,9 +155,15 @@ run_model () {
     date
     # Only the cache-*.arrow files go; the parquet download is the expensive part.
     free_map_cache
+    # _plan_hardware()'s auto gradient-checkpointing heuristic only weighs
+    # weight+grad+Adam state against VRAM (state/vram=29% here, under its 35%
+    # threshold), never activation memory -- so it left checkpointing off and
+    # whisper-large-v2 full-attention activations at batch-size 16 OOM'd on the
+    # very first training step (job 11745). Force it on explicitly.
     $PY -m csasr.train.train_whisper \
         --config "configs/train_${m}_large.yaml" \
         --out "$OUT_ROOT/${m}_large" \
+        --gradient-checkpointing on \
         "$@"
     df -h "$WORKDIR" | tail -1
 }

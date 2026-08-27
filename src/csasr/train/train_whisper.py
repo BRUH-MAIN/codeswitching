@@ -355,6 +355,13 @@ def main(argv: list[str] | None = None) -> int:
         c = cba(refs, hyps)
         return {"mer": mer(refs, hyps), "cba_he": c.he, "cba_eh": c.eh}
 
+    # tqdm's carriage-return progress bar renders fine on a real terminal but
+    # turns into unreadable repeated-line spam in a plain SLURM .out file, which
+    # isn't a tty. logging_steps=25 below already gives periodic textual
+    # progress; disable_tqdm just stops it from being drowned out by bar noise.
+    disable_tqdm = not sys.stdout.isatty()
+    print(f"[train] disable_tqdm={disable_tqdm} (stdout is{'' if not disable_tqdm else ' not'} a tty)")
+
     targs = Seq2SeqTrainingArguments(
         output_dir=str(args.out),
         per_device_train_batch_size=args.batch_size,
@@ -383,6 +390,7 @@ def main(argv: list[str] | None = None) -> int:
         metric_for_best_model="mer",
         greater_is_better=False,
         report_to=_report_to(args.report_to),
+        disable_tqdm=disable_tqdm,
         seed=args.seed,
         remove_unused_columns=False,
         label_names=["labels"],

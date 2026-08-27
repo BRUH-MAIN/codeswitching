@@ -45,6 +45,10 @@ fi
 export USE_TF=0
 export USE_FLAX=0
 
+# See train_a100.sh: sbatch fully buffers stdout, so unbuffer it to keep the
+# .out log live.
+export PYTHONUNBUFFERED=1
+
 # sbatch runs a COPY of this script from the spool dir, so BASH_SOURCE does not
 # locate the checkout. $SLURM_SUBMIT_DIR does. See train_a100.sh for the detail.
 if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then

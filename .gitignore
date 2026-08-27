@@ -273,3 +273,10 @@ checkpoint-*/
 # --- Hugging Face / model caches, if HF_HOME is pointed into the repo ---
 /.cache/
 /hf_home/
+
+# --- scripts/train_a100.sh's default WORKDIR: parquet/model/checkpoint cache,
+#     ~60 GB. Never belongs in git (see the script's own header comment). ---
+/csasr-work/
+
+# --- Per-job SLURM logs (scripts/*.sh write slurm-{train,eval,preflight}-%j.out) ---
+/slurm-*.out
