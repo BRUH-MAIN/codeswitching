@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import random
 import re
 import sys
 from pathlib import Path
@@ -24,11 +25,12 @@ from pathlib import Path
 from ..lid import Lang, all_bigrams, count_words
 from ..manifest import read_jsonl, write_jsonl
 from ..normalize import normalize
-from .backend import Sampling, build_backend
+from .backend import Sampling, add_server_args, build_backend, server_kwargs
 from .cache import ResponseCache
 from .prompts import sentence_messages
 
-__all__ = ["parse_sentences", "clean_sentence", "validate", "matrix_lang", "main"]
+__all__ = ["parse_sentences", "clean_sentence", "validate", "looks_spoken", "matrix_lang",
+           "MAX_PER_RESPONSE", "main"]
 
 # List markers: "1. ", "2) ", "- ", "* ".
 _LEAD = re.compile(r"^\s*(?:\d+\s*[.)]|[-*•])\s*")
@@ -46,6 +48,54 @@ _LANG_LABEL = re.compile(
 
 # Markdown emphasis the model sometimes wraps a whole sentence in.
 _WRAP = re.compile(r"^\s*[*_\"'`]+|[*_\"'`]+\s*$")
+
+
+# --------------------------------------------------------------------------
+# Is this line a sentence someone could SAY, or the model talking about its task?
+#
+# Found on Sarvam-30B with thinking "disabled": ~7% of what survived validation
+# was the model reasoning in the open --
+#
+#     I need to generate four sentences using the bigram "में default" in a ...
+#     Wait, let me reconsider. The bigram is "अपने typing" which is a ...
+#     English main language: The software can automatically capture करने (capture) ...
+#
+# and those lines PASS `validate`, because they quote the bigram and so carry
+# both scripts with the two words adjacent. Left in, Parler-TTS reads them out
+# and Whisper learns them. A further ~5% wrote Hindi in Latin letters
+# ("...drawing ko aur accha bana sakte hain"), which teaches exactly the wrong
+# script convention. Every check here is about the FORM of a line, never about
+# which model wrote it, and is applied to every LLM alike.
+# --------------------------------------------------------------------------
+
+#: The prompt asks for four. A response that yields more valid "sentences" is a
+#: reasoning chain or a repetition loop, not a generous answer.
+MAX_PER_RESPONSE = 4
+
+# Words that name the task rather than belong in a tutorial sentence.
+_META = re.compile(
+    r"\b(bigrams?|sentences?|hindi|english|hinglish|devanagari|main language|"
+    r"code[- ]?switch\w*|code[- ]?mix\w*|prompt|translat\w+|transliterat\w+)\b",
+    re.IGNORECASE,
+)
+# Quoting, glossing, markup, labels, numbering: things nobody pronounces.
+_MARKUP = re.compile(r"[\"“”‘’\[\]{}()<>_*#|=:;\\/]|\d\s*[.)]\s")
+# Hindi function words in Latin letters. None is an English word, and at least
+# one of them turns up in practically any romanized Hindi clause.
+_ROMAN_HI = re.compile(
+    r"\b(hai|hain|ho|hoga|hogi|tha|thi|the hain|ke|ki|ka|ko|se|mein|par|liye|kar|karke|"
+    r"karna|karne|karte|karo|kiya|nahi|nahin|aur|kya|yeh|ye|woh|hum|aap|raha|rahi|rahe|"
+    r"gaya|gayi|liya|diya|sakte|sakta|wala|bahut|accha|kaam|saath)\b",
+    re.IGNORECASE,
+)
+# Latin letters with diacritics: scholarly transliteration ("khali karane ke lēye").
+_DIACRITIC = re.compile(r"[\u00C0-\u024F\u1E00-\u1EFF]")
+
+
+def looks_spoken(sentence: str) -> bool:
+    """True if `sentence` reads as an utterance rather than commentary or markup."""
+    return not (_META.search(sentence) or _MARKUP.search(sentence)
+                or _ROMAN_HI.search(sentence) or _DIACRITIC.search(sentence))
 
 
 def clean_sentence(line: str) -> str:
@@ -116,10 +166,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-new-tokens", type=int, default=256)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--max-chars", type=int, default=400, help="Whisper label cap is 448 tokens")
+    # Ablation arm; see prompts.py for why it exists and what it changes.
+    ap.add_argument("--prompt-variant", choices=("paper", "matched"), default="paper")
+    ap.add_argument("--fewshot-manifest", type=Path, default=None,
+                    help="matched: in-domain transcripts to draw example sentences from")
+    ap.add_argument("--fewshot-n", type=int, default=5)
     # One process per GPU: device_map="auto" fits the model on ONE card and leaves
     # Kaggle's second T4 completely idle.
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--num-shards", type=int, default=1)
+    add_server_args(ap)
     args = ap.parse_args(argv)
 
     bigrams = list(read_jsonl(args.bigrams))
@@ -130,8 +186,31 @@ def main(argv: list[str] | None = None) -> int:
               f"{len(bigrams):,} of {total:,} bigrams")
     print(f"[gen_sentences] {len(bigrams):,} valid bigrams")
 
-    convs = [sentence_messages(b["bigram"]) for b in bigrams]
-    backend = build_backend(args.backend, model_id=args.model, filename=args.gguf_file)
+    if args.prompt_variant == "matched":
+        if not args.fewshot_manifest:
+            raise SystemExit("--prompt-variant matched needs --fewshot-manifest")
+        # Only sentences that actually switch, and long enough to show a style.
+        pool = [r["text"] for r in read_jsonl(args.fewshot_manifest)
+                if len(r.get("text", "").split()) >= 6
+                and (lambda c: c[Lang.HI] > 0 and c[Lang.EN] > 0)(count_words(r["text"]))]
+        if len(pool) < args.fewshot_n:
+            raise SystemExit(f"only {len(pool)} usable few-shot sentences in "
+                             f"{args.fewshot_manifest}")
+        print(f"[gen_sentences] matched prompt: {len(pool):,} in-domain example sentences")
+
+        def _examples(bigram: str) -> list[str]:
+            # Seeded by the bigram, so a prompt is identical on every re-run and
+            # in every shard -- which is what lets the response cache hit.
+            h = int(hashlib.sha1(f"{args.seed}:{bigram}".encode("utf-8")).hexdigest()[:8], 16)
+            return random.Random(h).sample(pool, args.fewshot_n)
+
+        convs = [sentence_messages(b["bigram"], variant="matched",
+                                   example_sentences=_examples(b["bigram"]))
+                 for b in bigrams]
+    else:
+        convs = [sentence_messages(b["bigram"]) for b in bigrams]
+    backend = build_backend(args.backend, model_id=args.model, filename=args.gguf_file,
+                            **server_kwargs(args))
     sampling = Sampling(
         temperature=args.temperature, max_new_tokens=args.max_new_tokens, seed=args.seed
     )
@@ -143,14 +222,22 @@ def main(argv: list[str] | None = None) -> int:
 
     seen: set[str] = set()
     rows = []
-    n_parsed = n_valid = 0
+    n_parsed = n_valid = n_unspoken = n_overflow = 0
     for b, resp in zip(bigrams, responses):
+        kept = 0
         for s in parse_sentences(resp):
             n_parsed += 1
             if len(s) > args.max_chars:
                 continue
             if not validate(s, b["hi_word"], b["en_word"]):
                 continue
+            if not looks_spoken(s):
+                n_unspoken += 1
+                continue
+            if kept >= MAX_PER_RESPONSE:
+                n_overflow += 1
+                continue
+            kept += 1
             n_valid += 1
             sid = _sent_id(s)
             if sid in seen:
@@ -167,6 +254,8 @@ def main(argv: list[str] | None = None) -> int:
     theoretical = len(bigrams) * 4
     n_hi = sum(r["matrix_lang"] == "hi" for r in rows)
     print(f"[gen_sentences] parsed={n_parsed:,}  valid={n_valid:,}  unique={n:,}")
+    print(f"[gen_sentences] rejected as not speech (commentary, markup, romanized "
+          f"Hindi): {n_unspoken:,}   beyond {MAX_PER_RESPONSE} per response: {n_overflow:,}")
     print(f"[gen_sentences] theoretical max {theoretical:,} (4 x {len(bigrams):,})")
     print(f"[gen_sentences] matrix language: hi={n_hi:,}  en={n - n_hi:,}")
     print("[gen_sentences] paper: ~16,000 unique from a theoretical 21,908")

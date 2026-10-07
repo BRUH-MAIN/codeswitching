@@ -278,5 +278,9 @@ checkpoint-*/
 #     ~60 GB. Never belongs in git (see the script's own header comment). ---
 /csasr-work/
 
+# --- CTranslate2 conversions of our fine-tuned checkpoints, ~2.9 GB each.
+#     Derived from csasr-work/exp/, regenerated on demand by eval/ct2.py. ---
+/ct2_models/
+
 # --- Per-job SLURM logs (scripts/*.sh write slurm-{train,eval,preflight}-%j.out) ---
 /slurm-*.out

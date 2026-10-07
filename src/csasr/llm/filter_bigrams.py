@@ -28,7 +28,7 @@ from pathlib import Path
 
 from ..lid import cs_bigrams, tokenize
 from ..manifest import read_jsonl, write_jsonl
-from .backend import Sampling, build_backend
+from .backend import Sampling, add_server_args, build_backend, server_kwargs
 from .cache import ResponseCache
 from .prompts import translation_check_messages
 
@@ -104,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
     # them identically; only the LLM translation check is split.
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--num-shards", type=int, default=1)
+    add_server_args(ap)
     args = ap.parse_args(argv)
 
     raw = [r["bigram"] for r in read_jsonl(args.raw)]
@@ -145,7 +146,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.skip_translation_check and pairs:
         chunks = [pairs[i : i + args.items_per_call] for i in range(0, len(pairs), args.items_per_call)]
         convs = [translation_check_messages([(hi, en) for _, hi, en in ch]) for ch in chunks]
-        backend = build_backend(args.backend, model_id=args.model, filename=args.gguf_file)
+        backend = build_backend(args.backend, model_id=args.model, filename=args.gguf_file,
+                            **server_kwargs(args))
         sampling = Sampling(temperature=args.temperature, max_new_tokens=8 * args.items_per_call, seed=args.seed)
 
         votes: dict[str, Counter] = {bg: Counter() for bg, _, _ in pairs}

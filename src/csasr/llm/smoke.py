@@ -20,7 +20,7 @@ import argparse
 import sys
 
 from ..manifest import read_jsonl
-from .backend import Sampling, build_backend
+from .backend import Sampling, add_server_args, build_backend, server_kwargs
 from .filter_bigrams import script_filter
 from .gen_bigrams import parse_bigrams
 from .prompts import bigram_messages
@@ -48,6 +48,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--bigrams-per-call", type=int, default=10)
     ap.add_argument("--temperature", type=float, default=0.9)
     ap.add_argument("--seed", type=int, default=1234)
+    add_server_args(ap)
     args = ap.parse_args(argv)
 
     examples = FALLBACK_EXAMPLES
@@ -61,7 +62,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[smoke] model  : {args.model}")
     print(f"[smoke] prompts: {args.n_calls} x {args.bigrams_per_call} bigrams\n")
 
-    backend = build_backend(args.backend, model_id=args.model, filename=args.gguf_file)
+    backend = build_backend(args.backend, model_id=args.model, filename=args.gguf_file,
+                            **server_kwargs(args))
     convs = [bigram_messages(examples, n=args.bigrams_per_call) for _ in range(args.n_calls)]
     responses = backend.chat(
         convs,

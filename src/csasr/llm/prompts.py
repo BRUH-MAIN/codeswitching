@@ -31,6 +31,7 @@ __all__ = [
     "BIGRAM_USER_TEMPLATE",
     "SENTENCE_SYSTEM",
     "SENTENCE_USER_TEMPLATE",
+    "SENTENCE_USER_TEMPLATE_MATCHED",
     "TRANSLATION_CHECK_SYSTEM",
     "TRANSLATION_CHECK_USER_TEMPLATE",
     "bigram_messages",
@@ -74,6 +75,32 @@ SENTENCE_USER_TEMPLATE = (
 )
 
 # --------------------------------------------------------------------------
+# Stage 2, ablation variant "matched".  OURS -- NOT from the paper.
+#
+# The verbatim prompt above asks for 2 English-matrix and 2 Hindi-matrix
+# sentences and shows the model no in-domain sentence. Measured on the corpus it
+# produced: the Hindi-matrix half is 9% Latin-script (exactly one English word,
+# everything else pure Hindi), the English-matrix half 92%. The target domain is
+# Hindi-matrix at 24% Latin, and a Whisper fine-tuned on that corpus reproduces
+# the 9% -- it starts writing English terms in Devanagari and loses to zero-shot.
+#
+# This variant changes only what that diagnosis implicates: all four sentences
+# are Hindi-matrix, and the model is shown real in-domain sentences so it
+# carries over THEIR convention for which words stay in Latin script. The paper
+# invites exactly this ("the prompts can be further refined").
+# --------------------------------------------------------------------------
+
+SENTENCE_USER_TEMPLATE_MATCHED = (
+    "Generate four sentences that would use this bigram in Hindi-English in a "
+    "natural way. Write all four sentences with Hindi as the main language, in "
+    "the style of the example sentences below: spoken software-tutorial "
+    "narration where technical and English-origin words are kept in English, "
+    "written in Latin script, exactly as the examples do, and all other words "
+    "are Hindi written in Devanagari. Example sentences: {examples} "
+    "Word bigram to use: {bigram}"
+)
+
+# --------------------------------------------------------------------------
 # Bigram filtering: translation check.  OURS - the paper describes but does not
 # quote this prompt. Batched to amortize the system prompt.
 # --------------------------------------------------------------------------
@@ -100,10 +127,22 @@ def bigram_messages(example_sentences: list[str], n: int = 10) -> list[dict]:
     ]
 
 
-def sentence_messages(bigram: str) -> list[dict]:
+def sentence_messages(
+    bigram: str, *, variant: str = "paper", example_sentences: list[str] | None = None
+) -> list[dict]:
+    """`variant="paper"` is the verbatim prompt; `"matched"` is the ablation arm."""
+    if variant == "paper":
+        user = SENTENCE_USER_TEMPLATE.format(bigram=bigram)
+    elif variant == "matched":
+        if not example_sentences:
+            raise ValueError("the 'matched' prompt needs in-domain example sentences")
+        examples = " ".join(s.strip().rstrip("।.") + "." for s in example_sentences)
+        user = SENTENCE_USER_TEMPLATE_MATCHED.format(bigram=bigram, examples=examples)
+    else:
+        raise ValueError(f"unknown prompt variant {variant!r}")
     return [
         {"role": "system", "content": SENTENCE_SYSTEM},
-        {"role": "user", "content": SENTENCE_USER_TEMPLATE.format(bigram=bigram)},
+        {"role": "user", "content": user},
     ]
 
 

@@ -105,6 +105,14 @@ $PY -m pip install -q -e ".[train]"
 export HF_HOME
 mkdir -p "$HF_HOME" "$OUT_ROOT"
 
+# train_whisper.py resumes from the latest checkpoint under --out by default
+# (needed since a walltime cap can cut a run off mid-training). Set
+# FROM_SCRATCH=1 to force a clean restart instead, e.g.:
+#   FROM_SCRATCH=1 sbatch --export=ALL,FROM_SCRATCH=1 scripts/train_a100.sh
+: "${FROM_SCRATCH:=0}"
+FROM_SCRATCH_FLAG=()
+[[ "$FROM_SCRATCH" == "1" ]] && FROM_SCRATCH_FLAG=(--from-scratch)
+
 # Fail now, not 40 minutes in, if the filesystem cannot hold the run.
 avail_gb=$(df -BG --output=avail "$WORKDIR" | tail -1 | tr -dc '0-9')
 echo "[disk] $WORKDIR has ${avail_gb} GB free"
@@ -117,9 +125,22 @@ fi
 
 # Token from the environment, never from argv -- argv leaks into every traceback
 # and into `ps` output for every other user on the node.
+#
+# Prefer an already-exported HF_TOKEN (e.g. from your shell profile or
+# --export=ALL,HF_TOKEN=...); otherwise fall back to the shared .env one level
+# above every project in this workspace (HF_ENV_FILE overrides the path). This
+# is the actual fix for job 11779, which died at this exact check because
+# HF_TOKEN had not been re-exported in the submitting shell.
+: "${HF_ENV_FILE:=$(dirname "$REPO")/.env}"
+if [[ -z "${HF_TOKEN:-}" && -f "$HF_ENV_FILE" ]]; then
+    HF_TOKEN=$(grep -m1 -E '^[[:space:]]*HF_TOKEN[[:space:]]*=' "$HF_ENV_FILE" \
+        | sed -E 's/^[[:space:]]*HF_TOKEN[[:space:]]*=[[:space:]]*//; s/[[:space:]]*$//; s/^"(.*)"$/\1/')
+    [[ -n "$HF_TOKEN" ]] && export HF_TOKEN
+fi
 if [[ -z "${HF_TOKEN:-}" ]]; then
-    echo "HF_TOKEN is unset. export it, or source a file that does:" >&2
-    echo "    export HF_TOKEN=\$(cat ~/.hf_token)" >&2
+    echo "HF_TOKEN is unset and not found in $HF_ENV_FILE. export it, or add a" >&2
+    echo "line there:" >&2
+    echo "    HF_TOKEN = <token>" >&2
     exit 1
 fi
 
@@ -164,17 +185,43 @@ run_model () {
         --config "configs/train_${m}_large.yaml" \
         --out "$OUT_ROOT/${m}_large" \
         --gradient-checkpointing on \
+        "${FROM_SCRATCH_FLAG[@]}" \
         "$@"
     df -h "$WORKDIR" | tail -1
+}
+
+# The paper trains M6/M7/M8 sequentially: M7 continues fine-tuning from M6's
+# checkpoint, and M8 -- described as testing whether OOD monolingual data "could
+# enhance a model previously fine-tuned with synthetic in-domain audio" --
+# continues from M7's, rather than each stage independently full-fine-tuning
+# openai/whisper-large-v2 from scratch. Independent runs is what job 11746 did,
+# and it is very likely why M6/M7/M8 got WORSE than zero-shot instead of better:
+# each stage full-fine-tunes 1.54B params for up to 5k steps on 6-35k narrow,
+# templated, 2-voice synthetic utterances (M6 alone hit ~18 epochs), which is a
+# catastrophic-forgetting regime independent of this chaining fix. configs/
+# train_m7_large.yaml / train_m8_large.yaml still say `model: openai/whisper-
+# large-v2` as documentation of "what to use if running this stage standalone";
+# the --model override below is what actually implements the chaining.
+require_prev_stage () {
+    local prev_out=$1 stage=$2
+    if [[ ! -d "$prev_out" ]]; then
+        echo "!! $stage is chained from $prev_out (sequential fine-tuning, per the" >&2
+        echo "   paper's procedure) but that directory does not exist. Run its prior" >&2
+        echo "   stage first (in this job or a previous one against the same WORKDIR)," >&2
+        echo "   or pass an explicit --model to fall back to a from-scratch start." >&2
+        exit 1
+    fi
 }
 
 for m in $MODELS; do
     case "$m" in
         m6) run_model m6 --subset-ids "$T1_IDS" ;;   # CLI overrides the yaml path
-        m7) run_model m7 ;;
+        m7) require_prev_stage "$OUT_ROOT/m6_large" m7
+            run_model m7 --model "$OUT_ROOT/m6_large" ;;
         # M8 needs cv_en on the Hub. It fails at load time if absent, before any
         # GPU work -- so a missing cv_en costs nothing but must not kill m6/m7.
-        m8) run_model m8 || echo "!! m8 failed (cv_en not on the Hub yet?)" ;;
+        m8) require_prev_stage "$OUT_ROOT/m7_large" m8
+            run_model m8 --model "$OUT_ROOT/m7_large" || echo "!! m8 failed (cv_en not on the Hub yet?)" ;;
         *)  echo "unknown model '$m'" >&2; exit 2 ;;
     esac
 done

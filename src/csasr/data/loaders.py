@@ -17,16 +17,18 @@ SR = 16_000
 
 def load_manifest_dataset(path: str | Path):
     """Build a `datasets.Dataset` from a JSONL manifest with a `wav` column."""
-    from datasets import Audio, Dataset
+    from datasets import Audio, load_dataset
 
-    from ..manifest import read_jsonl
-
-    rows = [r for r in read_jsonl(path) if r.get("wav")]
-    if not rows:
+    # load_dataset (not Dataset.from_list): the result is backed by an Arrow
+    # file on disk. An in-memory dataset keeps `.map` output in RAM, and
+    # featurizing 16-22k clips (~1 MB of log-mel each) across workers OOMs the job.
+    ds = load_dataset("json", data_files=str(path), split="train")
+    if "wav" not in ds.column_names:
         raise SystemExit(f"{path}: no rows with a `wav` field")
-    ds = Dataset.from_list(
-        [{"audio": r["wav"], "text": r["text"], "utt_id": r["utt_id"]} for r in rows]
-    )
+    ds = ds.filter(lambda wav: bool(wav), input_columns=["wav"], desc="manifest wav")
+    if len(ds) == 0:
+        raise SystemExit(f"{path}: no rows with a `wav` field")
+    ds = ds.rename_column("wav", "audio").select_columns(["audio", "text", "utt_id"])
     return ds.cast_column("audio", Audio(sampling_rate=SR))
 
 
@@ -43,7 +45,9 @@ def apply_subset(ds, ids_path: str | Path, id_column: str = "utt_id"):
     """Filter a dataset down to the ids listed in a JSON array (Train_T1)."""
     keep = set(json.loads(Path(ids_path).read_text(encoding="utf-8")))
     before = len(ds)
-    ds = ds.filter(lambda r: r[id_column] in keep, desc="subset")
+    # input_columns: without it `filter` materializes whole rows, which means
+    # decoding every audio clip just to compare an id.
+    ds = ds.filter(lambda v: v in keep, input_columns=[id_column], desc="subset")
     if len(ds) == 0:
         raise SystemExit(f"subset {ids_path} matched 0 of {before} rows on {id_column!r}")
     print(f"[subset] {len(ds):,} / {before:,} rows kept")

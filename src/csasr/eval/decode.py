@@ -34,7 +34,9 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
+from typing import Iterable, Iterator, TypeVar
 
 import numpy as np
 from tqdm import tqdm
@@ -45,6 +47,37 @@ from .grouping import concat_refs, group_by_recording, recording_id
 __all__ = ["main"]
 
 SR = 16_000
+
+T = TypeVar("T")
+
+
+def _progress(items: Iterable[T], *, desc: str, unit: str) -> Iterator[T]:
+    """tqdm on a real terminal; periodic plain-text lines otherwise.
+
+    tqdm's \\r-based updates don't overwrite in place in a SLURM .out file --
+    they just pile up into one unreadable multi-KB line (this is exactly what
+    happened to `datasets`' own "Generating train split" progress in an
+    earlier training run's log, which is why HF_DATASETS_DISABLE_PROGRESS_BARS
+    is set for this job). Falling back to periodic prints here, instead of
+    just disabling the bar, keeps the decode loop -- the actual long pole --
+    visible.
+    """
+    items = list(items)
+    total = len(items)
+    if sys.stdout.isatty():
+        yield from tqdm(items, desc=desc, unit=unit)
+        return
+    start = time.monotonic()
+    step = max(1, total // 20)  # ~20 updates across the whole run
+    for i, item in enumerate(items, 1):
+        yield item
+        if i % step == 0 or i == total:
+            elapsed = time.monotonic() - start
+            rate = i / elapsed if elapsed > 0 else 0.0
+            eta = (total - i) / rate if rate > 0 else 0.0
+            print(f"[decode] {desc}: {i}/{total} {unit} ({i / total:.0%}, "
+                  f"{elapsed:.0f}s elapsed, ~{eta:.0f}s left)", flush=True)
+
 
 # OpenAI's decoding heuristics, as faster-whisper / WhisperX apply them.
 TEMPERATURES = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
@@ -146,7 +179,7 @@ def _decode_faster_whisper(rows, args) -> list[dict]:
     print(f"[decode] {len(groups)} recording(s), language={language!r} ({how})")
 
     out = []
-    for reco, group in tqdm(sorted(groups.items()), desc="decode", unit="rec"):
+    for reco, group in _progress(sorted(groups.items()), desc="decode", unit="rec"):
         audio = _concat_audio(group)
         segments, info = engine.transcribe(audio, **common)
         text = " ".join(s.text.strip() for s in segments).strip()
@@ -190,7 +223,7 @@ def _decode_transformers(rows, args) -> list[dict]:
     if args.mode == "segment":
         print(f"[decode] transformers per-segment on {len(rows)} utts (dev metric only)")
         out = []
-        for start in tqdm(range(0, len(rows), args.batch_size), desc="decode", unit="batch"):
+        for start in _progress(range(0, len(rows), args.batch_size), desc="decode", unit="batch"):
             batch = rows[start : start + args.batch_size]
             arrays = [r["audio"]["array"] for r in batch]
             feats = processor.feature_extractor(
@@ -206,7 +239,7 @@ def _decode_transformers(rows, args) -> list[dict]:
     groups = group_by_recording(rows)
     print(f"[decode] transformers long-form, {len(groups)} recording(s), language={language!r}")
     out = []
-    for reco, group in tqdm(sorted(groups.items()), desc="decode", unit="rec"):
+    for reco, group in _progress(sorted(groups.items()), desc="decode", unit="rec"):
         audio = _concat_audio(group)
         inputs = processor(audio, sampling_rate=SR, return_tensors="pt",
                            truncation=False, padding="longest", return_attention_mask=True)

@@ -1,9 +1,15 @@
 """Stage 3: fine-tune Whisper on synthetic code-mixed speech (M6 / M7 / M8).
 
-Keeps the paper's optimizer recipe: full fine-tune, AdamW, peak lr 2e-5,
-effective batch 64, mixed precision, max 5k steps. No LoRA and no quantization,
-which also means `predict_with_generate` works and we can select checkpoints on
-a real MER rather than on validation loss.
+Keeps the paper's optimizer recipe by default: full fine-tune, AdamW, peak lr
+2e-5, effective batch 64, mixed precision, max 5k steps.
+
+`--ft-method lora|qlora` is the ablation path: the base model is frozen and only
+low-rank adapters train. LoRA and QLoRA share one adapter config and differ only
+in the precision the frozen base is held at (bf16/fp32 vs 4-bit NF4), so the
+comparison isolates quantization. Ablation runs also pass `--generate-eval off`:
+checkpoints are saved at fixed steps and selected afterwards by
+`csasr.eval.select`, which decodes dev with the same recording-level decoder
+the test set is scored under.
 
 Runs on two very different machines and *detects* which, rather than assuming:
 
@@ -101,14 +107,20 @@ def _plan_hardware(args, torch, n_params: int) -> dict:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
+    peft = getattr(args, "ft_method", "full") != "full"
+    if peft:
+        # The frozen base carries no grads and no Adam moments, so the 16
+        # bytes/param figure does not apply: only the weights themselves.
+        state = n_params * 4 / 1e9
     if args.gradient_checkpointing == "auto":
-        ckpt = state > CHECKPOINT_VRAM_FRACTION * vram
+        ckpt = (not peft) and state > CHECKPOINT_VRAM_FRACTION * vram
     else:
         ckpt = args.gradient_checkpointing == "on"
 
     print(f"[train] device   {props.name}  sm{cap[0]}{cap[1]}  {vram:.0f} GB")
     print(f"[train] params   {n_params/1e6:,.0f} M  -> ~{state:.1f} GB of "
-          f"fp32 param+grad+Adam state ({state/vram:.0%} of VRAM)")
+          f"{'frozen fp32 weights' if peft else 'fp32 param+grad+Adam state'} "
+          f"({state/vram:.0%} of VRAM)")
     print(f"[train] precision {'bf16' if bf16 else 'fp16' if fp16 else 'fp32'}"
           f"   tf32 {'on' if tf32 else 'off'}"
           f"   grad-checkpointing {'on' if ckpt else 'off'}")
@@ -180,6 +192,18 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--subset-ids", type=Path, default=None, help="t1_ids.json -> M6")
     ap.add_argument("--extra-hf", nargs="*", default=[], help="repo:config for CV mono -> M8")
     ap.add_argument("--extra-manifest", type=Path, nargs="*", default=[])
+    # M8 mixes ~18k code-switched utterances with ~17k Common Voice monolingual
+    # ones -- roughly 1:1, so on average half of every effective batch carries no
+    # code-switch signal at all, vs. M7's 100%. Repeating the code-switched set
+    # keeps every training example the model sees (all of --extra-hf still
+    # appears once per epoch) while raising its share of gradient updates,
+    # without touching lr/batch-size/steps -- the paper states those as fixed
+    # across every model, so this is a data-composition knob, not a recipe
+    # deviation.
+    ap.add_argument("--oversample-train", type=int, default=1,
+                    help="repeat --train-hf/-manifest this many times before "
+                         "concatenating --extra-hf, so it isn't diluted 1:1 by "
+                         "monolingual data (M8)")
     ap.add_argument("--dev-hf", default=None)
     ap.add_argument("--dev-config", default="dev")
     ap.add_argument("--dev-manifest", type=Path, default=None)
@@ -204,6 +228,35 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--warmup-steps", type=int, default=200)
     ap.add_argument("--eval-steps", type=int, default=250)
     ap.add_argument("--patience", type=int, default=4)
+    ap.add_argument("--select-by", choices=("mer", "score"), default="mer",
+                    help="checkpoint-selection metric. 'score' = mer/(cba_total+1), "
+                         "which penalizes a collapsed CBA that plain MER selection "
+                         "would not catch (M8)")
+    # ---- ablation: fine-tuning method -----------------------------------
+    ap.add_argument("--ft-method", choices=("full", "lora", "qlora"), default="full",
+                    help="full = the paper's recipe; lora = frozen base + adapters; "
+                         "qlora = the same adapters on a 4-bit NF4 base")
+    ap.add_argument("--lora-r", type=int, default=32)
+    ap.add_argument("--lora-alpha", type=int, default=64)
+    ap.add_argument("--lora-dropout", type=float, default=0.05)
+    ap.add_argument("--lora-targets", nargs="+", default=["q_proj", "v_proj"],
+                    help="module-name suffixes to adapt (encoder and decoder both)")
+    # ---- ablation: fixed-step checkpoints, selected post hoc -------------
+    ap.add_argument("--save-steps", type=int, default=None,
+                    help="checkpoint interval; defaults to --eval-steps")
+    ap.add_argument("--generate-eval", choices=("on", "off"), default="on",
+                    help="off = dev LOSS only during training (no generate, no early "
+                         "stopping, no best-model reload); checkpoints are then "
+                         "selected by csasr.eval.select with the test decoder")
+    # Twenty steps on 2% of the data already moved test MER and CBA well past
+    # zero-shot in the smoke run, while the earlier 1000+ step runs ended up
+    # below it -- so the interesting part of the curve is BEFORE the first
+    # regular checkpoint, and has to be saved to be selectable.
+    ap.add_argument("--save-at", type=int, nargs="*", default=None,
+                    help="extra checkpoint steps on top of --save-steps; default "
+                         "50 100 when --generate-eval off, none otherwise")
+    ap.add_argument("--dev-max-utts", type=int, default=0,
+                    help="seeded subsample of dev for the in-training eval; 0 = all")
     ap.add_argument("--language", default="hi", help="training prompt language token")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--dataset-fraction", type=float, default=1.0)
@@ -232,6 +285,12 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--save-optimizer", action="store_true",
                     help="keep AdamW state in checkpoints so training can resume; "
                          "triples checkpoint size (18.5 GB each for large-v2)")
+    # Resuming is the default whenever --out already has a checkpoint (a SLURM
+    # walltime cap can cut a run off mid-training, same story as a100/hf_sync.py
+    # on the policyswitching side) -- --from-scratch is the explicit opt-out.
+    ap.add_argument("--from-scratch", action="store_true",
+                    help="ignore any existing checkpoint under --out and start at step 0 "
+                         "(default: resume from the latest checkpoint there, if any)")
     return ap
 
 
@@ -260,6 +319,7 @@ def main(argv: list[str] | None = None) -> int:
         WhisperForConditionalGeneration,
         WhisperProcessor,
     )
+    from transformers.trainer_utils import get_last_checkpoint
 
     from ..data.loaders import apply_subset, concat, load_hub_dataset, load_manifest_dataset
     from ..eval.cba import cba
@@ -281,25 +341,62 @@ def main(argv: list[str] | None = None) -> int:
     # low_cpu_mem_usage loads shard-by-shard into the final placement instead of
     # materialising a second full fp32 copy in host RAM. large-v2 is 6.2 GB, so
     # on a 16 GB SLURM allocation the naive path is a real OOM risk.
+    load_kw = {"low_cpu_mem_usage": True}
+    if args.ft_method == "qlora":
+        from transformers import BitsAndBytesConfig
+
+        # NF4 + double quantization, bf16 compute: the QLoRA paper's setting.
+        # Only nn.Linear is quantized; the two conv layers, LayerNorms and
+        # embeddings stay in floating point.
+        load_kw["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+        load_kw["device_map"] = {"": 0}
     try:
         model = WhisperForConditionalGeneration.from_pretrained(
-            args.model, attn_implementation=attn, low_cpu_mem_usage=True
+            args.model, attn_implementation=attn, **load_kw
         )
     except (TypeError, ValueError) as e:
         print(f"[train] attn_implementation={attn!r} rejected ({e}); using the default")
-        model = WhisperForConditionalGeneration.from_pretrained(
-            args.model, low_cpu_mem_usage=True
-        )
+        model = WhisperForConditionalGeneration.from_pretrained(args.model, **load_kw)
         attn = "default"
     print(f"[train] attention {attn}")
 
-    hw = _plan_hardware(args, torch, sum(p.numel() for p in model.parameters()))
+    # num_parameters(), not a sum of numel(): a 4-bit layer stores its weights
+    # packed, so numel() reports about half the real count and QLoRA would look
+    # like it trains twice the share of the model that LoRA does.
+    n_total = model.num_parameters()
+    hw = _plan_hardware(args, torch, n_total)
 
     model.config.forced_decoder_ids = None
     model.config.suppress_tokens = []
     model.generation_config.forced_decoder_ids = None
-    model.generation_config.language = args.language
+    # NOT args.language. Training loss uses tokenizer.set_prefix_tokens(language=
+    # args.language) above, which forces <|hi|> into the labels -- unaffected by
+    # this. But predict_with_generate (compute_metrics below, i.e. every eval and
+    # therefore load_best_model_at_end / EarlyStoppingCallback) reads this
+    # attribute at generate() time, and the paper's test protocol -- and this
+    # repo's own decode.py -- score under auto-detect (`language=None`), not
+    # forced Hindi. Leaving this at "hi" silently picks "best" checkpoints under
+    # a decoding condition that never matches how the model is actually scored.
+    model.generation_config.language = None
     model.generation_config.task = "transcribe"
+
+    if args.ft_method != "full":
+        from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+        if args.ft_method == "qlora":
+            # Freezes the base and casts the non-quantized params to fp32.
+            # Gradient checkpointing is wired by the Trainer from `hw`, not here.
+            model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+        model = get_peft_model(model, LoraConfig(
+            r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+            target_modules=list(args.lora_targets), bias="none",
+        ))
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[train] ft-method {args.ft_method}: {n_trainable/1e6:,.2f} M trainable "
+          f"of {n_total/1e6:,.0f} M ({n_trainable/n_total:.2%})")
 
     # ---- data ----------------------------------------------------------
     def _load(hf, cfg, manifest, split="train"):
@@ -314,6 +411,12 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("need --train-hf or --train-manifest")
     if args.subset_ids:
         train = apply_subset(train, args.subset_ids)
+
+    if args.oversample_train > 1:
+        before = len(train)
+        train = concat([train] * args.oversample_train)
+        print(f"[train] oversampled primary train set {args.oversample_train}x: "
+              f"{before:,} -> {len(train):,} utts")
 
     extras = []
     for spec in args.extra_hf:
@@ -331,6 +434,9 @@ def main(argv: list[str] | None = None) -> int:
         n = max(1, int(len(train) * args.dataset_fraction))
         train = train.shuffle(seed=args.seed).select(range(n))
         dev = dev.select(range(min(len(dev), max(8, n // 10))))
+
+    if args.dev_max_utts and len(dev) > args.dev_max_utts:
+        dev = dev.shuffle(seed=args.seed).select(range(args.dev_max_utts))
 
     print(f"[train] train={len(train):,} utts   dev={len(dev):,} utts")
     print(f"[train] effective batch {args.batch_size} x {args.grad_accum} = "
@@ -353,7 +459,23 @@ def main(argv: list[str] | None = None) -> int:
         hyps = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
         refs = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
         c = cba(refs, hyps)
-        return {"mer": mer(refs, hyps), "cba_he": c.he, "cba_eh": c.eh}
+        m = mer(refs, hyps)
+        return {
+            "mer": m,
+            "cba_he": c.he,
+            "cba_eh": c.eh,
+            "cba_total": c.total,
+            # MER-only selection can lock in a checkpoint whose code-switch
+            # accuracy has collapsed while MER still looks fine (confirmed for
+            # M8: CBA-HE stuck under ~14% for the entire run, from the very
+            # first eval, while MER kept improving). Dividing by cba_total+1
+            # makes a near-zero-CBA checkpoint score much worse regardless of
+            # MER, without CBA needing to already dominate a raw weighted sum
+            # across two differently-scaled metrics. Only used when
+            # --select-by score (see train_m8_large.yaml); M6/M7 keep the
+            # plain "mer" selection that already produces the right ordering.
+            "score": m / (c.total + 1.0),
+        }
 
     # tqdm's carriage-return progress bar renders fine on a real terminal but
     # turns into unreadable repeated-line spam in a plain SLURM .out file, which
@@ -361,6 +483,15 @@ def main(argv: list[str] | None = None) -> int:
     # progress; disable_tqdm just stops it from being drowned out by bar noise.
     disable_tqdm = not sys.stdout.isatty()
     print(f"[train] disable_tqdm={disable_tqdm} (stdout is{'' if not disable_tqdm else ' not'} a tty)")
+
+    gen_eval = args.generate_eval == "on"
+    save_steps = args.save_steps or args.eval_steps
+    if not gen_eval and args.max_steps % save_steps:
+        raise SystemExit(f"--max-steps {args.max_steps} is not a multiple of --save-steps "
+                         f"{save_steps}: the final step would never be checkpointed")
+    if gen_eval and save_steps % args.eval_steps:
+        raise SystemExit(f"--save-steps {save_steps} must be a multiple of --eval-steps "
+                         f"{args.eval_steps} when the best checkpoint is reloaded at the end")
 
     targs = Seq2SeqTrainingArguments(
         output_dir=str(args.out),
@@ -374,8 +505,9 @@ def main(argv: list[str] | None = None) -> int:
         **hw,  # fp16 / bf16 / tf32 / gradient_checkpointing, from _plan_hardware
         eval_strategy="steps",
         eval_steps=args.eval_steps,
-        save_steps=args.eval_steps,
-        save_total_limit=args.save_total_limit,
+        save_steps=save_steps,
+        # 0 keeps every checkpoint, which post-hoc selection needs.
+        save_total_limit=args.save_total_limit or None,
         # A Trainer checkpoint normally carries the AdamW state too -- 2 bytes of
         # moment per byte of parameter. For large-v2 that is 6.2 GB of weights
         # PLUS 12.3 GB of optimizer per checkpoint, so save_total_limit=2 quietly
@@ -384,11 +516,14 @@ def main(argv: list[str] | None = None) -> int:
         # 37 GB -> 12.4 GB. Set --save-optimizer if you actually need to resume.
         save_only_model=not args.save_optimizer,
         logging_steps=25,
-        predict_with_generate=True,
+        predict_with_generate=gen_eval,
+        # Without generate the Trainer would otherwise gather full-vocabulary
+        # logits for every dev utterance just to throw them away.
+        prediction_loss_only=not gen_eval,
         generation_max_length=225,
-        load_best_model_at_end=True,
-        metric_for_best_model="mer",
-        greater_is_better=False,
+        load_best_model_at_end=gen_eval,
+        metric_for_best_model=args.select_by if gen_eval else None,
+        greater_is_better=False if gen_eval else None,
         report_to=_report_to(args.report_to),
         disable_tqdm=disable_tqdm,
         seed=args.seed,
@@ -397,25 +532,86 @@ def main(argv: list[str] | None = None) -> int:
         dataloader_num_workers=args.dataloader_workers,
     )
 
+    save_at = args.save_at if args.save_at is not None else ([] if gen_eval else [50, 100])
+    save_at = sorted({s for s in save_at if 0 < s < args.max_steps and s % save_steps})
+    extra_callbacks = []
+    if save_at:
+        from transformers import TrainerCallback
+
+        class _SaveAt(TrainerCallback):
+            def on_step_end(self, targs_, state, control, **kw):
+                if state.global_step in save_at:
+                    control.should_save = True
+                return control
+
+        extra_callbacks.append(_SaveAt())
+        print(f"[train] extra checkpoints at steps {save_at}")
+
     trainer = Seq2SeqTrainer(
         args=targs,
         model=model,
         train_dataset=train,
         eval_dataset=dev,
         data_collator=collator,
-        compute_metrics=compute_metrics,
+        compute_metrics=compute_metrics if gen_eval else None,
         processing_class=processor,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=args.patience)],
+        callbacks=([EarlyStoppingCallback(early_stopping_patience=args.patience)]
+                   if gen_eval else []) + extra_callbacks,
     )
 
-    result = trainer.train()
-    trainer.save_model(str(args.out))
-    processor.save_pretrained(str(args.out))
+    # get_last_checkpoint returns None on a fresh/nonexistent --out, so this is
+    # a no-op the first time a model is trained. Without --save-optimizer,
+    # resumed checkpoints restore model weights and the trainer's global_step
+    # (so the LR schedule and step count pick up correctly) but not Adam's
+    # momentum/variance -- transformers silently re-initializes those rather
+    # than erroring, since they're optional. That is an acceptable soft resume
+    # for surviving a walltime cutoff; pass --save-optimizer up front for a
+    # bit-exact one.
+    resume_checkpoint = None
+    if args.from_scratch:
+        print("[train] --from-scratch: ignoring any existing checkpoint under --out")
+    elif args.out.exists():
+        resume_checkpoint = get_last_checkpoint(str(args.out))
+    print(f"[train] {'resuming from ' + resume_checkpoint if resume_checkpoint else 'starting from step 0'}")
 
-    print(f"[train] finished at step {result.global_step:,} "
-          f"(max_steps={args.max_steps}; early stopping may have fired)")
-    print(f"[train] best {targs.metric_for_best_model} = "
-          f"{trainer.state.best_metric}")
+    result = trainer.train(resume_from_checkpoint=resume_checkpoint)
+    # With post-hoc selection the last checkpoint already IS the final model;
+    # a second copy at the top level would cost another 6.2 GB for large-v2.
+    if gen_eval:
+        trainer.save_model(str(args.out))
+    processor.save_pretrained(str(args.out))
+    # Not written automatically by trainer.train() -- without this, the full
+    # loss/metric history (log_history, used by plot_metrics.py) only survives
+    # inside individual checkpoint-N/ dirs, which save_total_limit prunes away.
+    trainer.save_state()
+
+    # What the fine-tuning-method ablation compares besides accuracy.
+    import json
+
+    peak_gb = (torch.cuda.max_memory_allocated() / 1e9) if torch.cuda.is_available() else 0.0
+    meta = {
+        "model": str(args.model), "ft_method": args.ft_method,
+        "params_total": n_total, "params_trainable": n_trainable,
+        "trainable_pct": round(100 * n_trainable / n_total, 3),
+        "peak_vram_gb": round(peak_gb, 1),
+        "train_runtime_s": round(result.metrics.get("train_runtime", 0.0)),
+        "global_step": result.global_step, "lr": args.lr,
+        "batch_size": args.batch_size, "grad_accum": args.grad_accum,
+        "train_utts": len(train), "seed": args.seed,
+        # A resumed run only timed (and only peaked) over its final leg.
+        "resumed": bool(resume_checkpoint),
+    }
+    (args.out / "run_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    print(f"[train] run_meta {meta}")
+
+    if gen_eval:
+        print(f"[train] finished at step {result.global_step:,} "
+              f"(max_steps={args.max_steps}; early stopping may have fired)")
+        print(f"[train] best {targs.metric_for_best_model} = "
+              f"{trainer.state.best_metric}")
+    else:
+        print(f"[train] finished at step {result.global_step:,}; checkpoints every "
+              f"{save_steps} steps await csasr.eval.select")
     print(f"[train] model -> {args.out}")
     return 0
 

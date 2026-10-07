@@ -27,7 +27,7 @@ import sys
 from pathlib import Path
 
 from ..manifest import read_jsonl, write_jsonl
-from .gen_sentences import clean_sentence, matrix_lang, validate
+from .gen_sentences import clean_sentence, looks_spoken, matrix_lang, validate
 
 __all__ = ["main"]
 
@@ -64,6 +64,9 @@ def main(argv: list[str] | None = None) -> int:
         old = r["text"]
         new = clean_sentence(old)
         if not new or len(new) > args.max_chars or len(new.split()) < 3:
+            dropped += 1
+            continue
+        if not looks_spoken(new):
             dropped += 1
             continue
 

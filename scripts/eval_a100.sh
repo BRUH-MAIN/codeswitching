@@ -16,7 +16,7 @@
 #
 #SBATCH --job-name=csasr-eval
 #SBATCH --partition=workq
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --nodelist=asaicomputenode02
 #SBATCH --cpus-per-task=4
@@ -49,6 +49,14 @@ export USE_FLAX=0
 # .out log live.
 export PYTHONUNBUFFERED=1
 
+# `datasets`' own load/map progress bars use \r updates same as tqdm -- in a
+# flat .out file (not a tty) those don't overwrite in place, they just pile up
+# into one unreadable multi-KB line (this is exactly what happened to the
+# "Generating train split" lines in an earlier training run's log). The actual
+# decode loop below gets its own tty-aware periodic progress printer instead,
+# so this only trades away the brief one-time dataset-loading bar.
+export HF_DATASETS_DISABLE_PROGRESS_BARS=1
+
 # sbatch runs a COPY of this script from the spool dir, so BASH_SOURCE does not
 # locate the checkout. $SLURM_SUBMIT_DIR does. See train_a100.sh for the detail.
 if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
@@ -74,8 +82,19 @@ $PY -m pip install -q -e ".[decode]"
 export HF_HOME
 mkdir -p "$RESULTS" "$HF_HOME"
 
+# Prefer an already-exported HF_TOKEN; otherwise fall back to the shared .env
+# one level above every project in this workspace (HF_ENV_FILE overrides the
+# path).
+: "${HF_ENV_FILE:=$(dirname "$REPO")/.env}"
+if [[ -z "${HF_TOKEN:-}" && -f "$HF_ENV_FILE" ]]; then
+    HF_TOKEN=$(grep -m1 -E '^[[:space:]]*HF_TOKEN[[:space:]]*=' "$HF_ENV_FILE" \
+        | sed -E 's/^[[:space:]]*HF_TOKEN[[:space:]]*=[[:space:]]*//; s/[[:space:]]*$//; s/^"(.*)"$/\1/')
+    [[ -n "$HF_TOKEN" ]] && export HF_TOKEN
+fi
 if [[ -z "${HF_TOKEN:-}" ]]; then
-    echo "HF_TOKEN is unset (needed to pull the private test split)." >&2
+    echo "HF_TOKEN is unset (needed to pull the private test split) and not" >&2
+    echo "found in $HF_ENV_FILE. export it, or add a line there:" >&2
+    echo "    HF_TOKEN = <token>" >&2
     exit 1
 fi
 

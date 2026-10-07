@@ -122,8 +122,18 @@ PY
 
 echo ""
 echo "---- hub reachability (compute nodes are often air-gapped) ---"
+# Prefer an already-exported HF_TOKEN; otherwise fall back to the shared .env
+# one level above every project in this workspace (HF_ENV_FILE overrides the
+# path). This script has no REPO anchor of its own (see train_a100.sh for why
+# one is needed elsewhere), so use SLURM_SUBMIT_DIR directly.
+: "${HF_ENV_FILE:=$(dirname "${SLURM_SUBMIT_DIR:-$PWD}")/.env}"
+if [[ -z "${HF_TOKEN:-}" && -f "$HF_ENV_FILE" ]]; then
+    HF_TOKEN=$(grep -m1 -E '^[[:space:]]*HF_TOKEN[[:space:]]*=' "$HF_ENV_FILE" \
+        | sed -E 's/^[[:space:]]*HF_TOKEN[[:space:]]*=[[:space:]]*//; s/[[:space:]]*$//; s/^"(.*)"$/\1/')
+    [[ -n "$HF_TOKEN" ]] && export HF_TOKEN
+fi
 if [[ -z "${HF_TOKEN:-}" ]]; then
-    echo "  HF_TOKEN unset -- export it before the real run"
+    echo "  HF_TOKEN unset and not found in $HF_ENV_FILE -- export it before the real run"
 else
     $PY - <<'PY'
 import os

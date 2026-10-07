@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 from ..manifest import read_jsonl, write_jsonl
-from .backend import Sampling, build_backend
+from .backend import Sampling, add_server_args, build_backend, server_kwargs
 from .cache import ResponseCache
 from .prompts import bigram_messages
 
@@ -68,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     #   CUDA_VISIBLE_DEVICES=1 ... --shard 1 --num-shards 2 &
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--num-shards", type=int, default=1)
+    add_server_args(ap)
     args = ap.parse_args(argv)
 
     texts = [r["text"] for r in read_jsonl(args.train_manifest) if r.get("text", "").strip()]
@@ -89,7 +90,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[gen_bigrams] shard {args.shard}/{args.num_shards}: "
               f"{len(convs):,} of {args.n_calls:,} calls")
 
-    backend = build_backend(args.backend, model_id=args.model, filename=args.gguf_file)
+    backend = build_backend(args.backend, model_id=args.model, filename=args.gguf_file,
+                            **server_kwargs(args))
     sampling = Sampling(
         temperature=args.temperature, max_new_tokens=args.max_new_tokens, seed=args.seed
     )

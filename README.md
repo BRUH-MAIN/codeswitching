@@ -70,6 +70,47 @@ overridable (`--precision`, `--tf32`, `--gradient-checkpointing`).
 
 ---
 
+## Ablation study
+
+The replication does not reproduce: on test every fine-tuned model is worse than
+zero-shot (M6 56.1, M7 54.4, M8 58.0 against 51.8). The ablation asks which part
+of the pipeline is responsible, along four axes:
+
+| Axis | Values |
+|---|---|
+| ASR model | whisper-small, -medium, -large-v2, and MMS-1B (CTC, no decoder) |
+| Fine-tuning method | full, LoRA, QLoRA (same adapter; QLoRA holds the base in 4-bit) |
+| Text-generation LLM | Gemma-4-26B-A4B (existing corpus), Gemma-4-31B, Sarvam-30B (Sarvam-105B was dropped: it did not follow the bigram prompt without thinking) |
+| Sentence prompt | paper-verbatim, and a domain-matched variant |
+
+```bash
+sbatch scripts/ablate.sh                                              # everything
+sbatch --export=ALL,STAGES="zeroshot grid mms llm report" scripts/ablate.sh
+sbatch --export=ALL,STAGES="text tts llm report"          scripts/ablate.sh
+sbatch --export=ALL,SMOKE=1 --time=02:00:00               scripts/ablate.sh
+```
+
+[`scripts/ablate.sh`](scripts/ablate.sh) requests the partition's 3-day maximum,
+resubmits itself when the walltime cap approaches, and can be submitted several
+times at once: each unit of work is locked and marked done, so concurrent jobs
+split the study across GPUs. Results land in `results/ablation/` (`report.md`,
+`ablation.csv`, figures). Outcome and caveats: [`ABLATION_PROGRESS.md`](ABLATION_PROGRESS.md).
+
+What differs from the M6/M7/M8 runs above, and why:
+
+* **Checkpoints are selected after training, with the test decoder**
+  ([`select.py`](src/csasr/eval/select.py)). The in-training dev metric swung
+  between 47 and 75 MER from one eval to the next and cost ~18 minutes each.
+* **Every run starts from the public checkpoint.** M7 and M8 were chained from
+  the previous model.
+* **Every corpus is cut to 22 h**, so the LLM axis compares text, not amounts.
+* **The matched prompt** exists because of a measured cause: the synthetic
+  Hindi-matrix sentences are 9% Latin-script against 20% in MUCS, and the
+  fine-tuned models copy that (7-9% Latin output against 17% zero-shot), writing
+  English terms in Devanagari. See [`prompts.py`](src/csasr/llm/prompts.py).
+
+---
+
 ## Pipeline
 
 ```

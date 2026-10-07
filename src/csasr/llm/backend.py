@@ -1,6 +1,12 @@
 """LLM serving backends.
 
-TWO backends, selected by config `backend:`.
+THREE backends, selected by config `backend:`.
+
+* `OpenAIBackend` -- an HTTP client for any OpenAI-compatible chat endpoint. On
+  the A100 cluster this is the path: one `llama-server` (or vLLM) process holds
+  the model with several parallel slots, and requests go to it concurrently.
+  That is what makes a 105B model feasible, and it keeps every LLM in the
+  text-generation ablation behind the same client code.
 
 * `LlamaCppBackend` (DEFAULT) -- GGUF via llama-cpp-python, serving
   `unsloth/gemma-4-26B-A4B-it-GGUF` (25.2B / 3.8B-active MoE, ~16 GB Q4_K_M)
@@ -40,7 +46,10 @@ __all__ = [
     "LLMBackend",
     "TransformersBackend",
     "LlamaCppBackend",
+    "OpenAIBackend",
     "EchoBackend",
+    "add_server_args",
+    "server_kwargs",
     "build_backend",
     "strip_thinking",
 ]
@@ -83,6 +92,9 @@ class LLMBackend(abc.ABC):
     ) -> list[str]:
         """Cached, batched chat. Cache hits never reach the model."""
         convs = list(convs)
+        # Self-consistency voting re-asks the SAME conversation; a backend that
+        # seeds per request needs this to draw a different sample each time.
+        self._sample_idx = sample_idx
         out: list[str | None] = [None] * len(convs)
         todo: list[int] = []
 
@@ -499,6 +511,102 @@ class LlamaCppBackend(LLMBackend):
         return outs
 
 
+class OpenAIBackend(LLMBackend):
+    """Client for an OpenAI-compatible `/v1/chat/completions` endpoint.
+
+    The server (llama.cpp's `llama-server`, vLLM, or a hosted API) owns the
+    model; this class only sends requests, `concurrency` at a time, which is
+    what lets the server's parallel slots / continuous batching do their work.
+    stdlib `urllib` on purpose: no new dependency in the LLM stage.
+    """
+
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        base_url: str = "http://127.0.0.1:8080/v1",
+        api_key: str | None = None,
+        concurrency: int = 8,
+        disable_thinking: bool = True,
+        top_k: int | None = None,
+        timeout: float = 600.0,
+        retries: int = 4,
+        **_ignored,
+    ):
+        self.model_id = model_id
+        self.url = base_url.rstrip("/") + "/chat/completions"
+        self.api_key = api_key
+        self.concurrency = max(1, concurrency)
+        self.disable_thinking = disable_thinking
+        self.top_k = top_k
+        self.timeout = timeout
+        self.retries = retries
+        self._think_kwarg_ok = True  # dropped on the first 4xx that names it
+        print(f"[llm] openai-compatible endpoint {self.url}  model={model_id}  "
+              f"concurrency={self.concurrency}")
+
+    def _post(self, body: dict) -> dict:
+        import json
+        import urllib.request
+
+        req = urllib.request.Request(
+            self.url, data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     **({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {})},
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _one(self, conv: list[dict], sampling: Sampling) -> str:
+        import time
+        import urllib.error
+
+        body = {
+            "model": self.model_id,
+            "messages": conv,
+            "temperature": sampling.temperature,
+            "top_p": sampling.top_p,
+            "max_tokens": sampling.max_new_tokens,
+        }
+        if sampling.seed is not None:
+            body["seed"] = sampling.seed + getattr(self, "_sample_idx", 0)
+        if self.top_k is not None:
+            body["top_k"] = self.top_k
+
+        last: Exception | None = None
+        for attempt in range(self.retries + 1):
+            if self.disable_thinking and self._think_kwarg_ok:
+                body["chat_template_kwargs"] = {"enable_thinking": False}
+            else:
+                body.pop("chat_template_kwargs", None)
+            try:
+                r = self._post(body)
+                content = r["choices"][0]["message"].get("content") or ""
+                return strip_thinking(content) if self.disable_thinking else content
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode("utf-8", "replace")[:300]
+                # A hosted API may reject the llama.cpp/vLLM-only kwarg; drop it
+                # once and fall back to stripping the reasoning from the output.
+                if e.code in (400, 422) and "chat_template_kwargs" in body:
+                    print(f"[llm] endpoint rejected chat_template_kwargs ({e.code}); "
+                          f"stripping reasoning from output instead")
+                    self._think_kwarg_ok = False
+                    continue
+                last = RuntimeError(f"HTTP {e.code}: {detail}")
+                if e.code < 500 and e.code != 429:
+                    break  # a client error will not fix itself
+            except (urllib.error.URLError, TimeoutError, ConnectionError, KeyError) as e:
+                last = e
+            time.sleep(min(60.0, 2.0 ** attempt))
+        raise RuntimeError(f"LLM request failed after {self.retries + 1} attempt(s): {last}")
+
+    def _generate(self, convs: list[list[dict]], sampling: Sampling) -> list[str]:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
+            return list(pool.map(lambda c: self._one(c, sampling), convs))
+
+
 class EchoBackend(LLMBackend):
     """Deterministic stub for unit tests. Returns a canned response per prompt."""
 
@@ -515,6 +623,27 @@ class EchoBackend(LLMBackend):
         ]
 
 
+_SERVER_KEYS = ("base_url", "api_key", "concurrency")
+
+
+def add_server_args(ap) -> None:
+    """`--backend openai` flags, shared by every LLM-stage CLI."""
+    ap.add_argument("--base-url", default="http://127.0.0.1:8080/v1",
+                    help="--backend openai: OpenAI-compatible endpoint")
+    ap.add_argument("--concurrency", type=int, default=8,
+                    help="--backend openai: requests in flight at once")
+    # The NAME of the variable, never the key itself: argv is visible in `ps`.
+    ap.add_argument("--api-key-env", default="LLM_API_KEY",
+                    help="--backend openai: env var holding the API key, if any")
+
+
+def server_kwargs(args) -> dict:
+    import os
+
+    return {"base_url": args.base_url, "concurrency": args.concurrency,
+            "api_key": os.environ.get(args.api_key_env) or None}
+
+
 def build_backend(name: str, **kw) -> LLMBackend:
     """Route kwargs to the selected backend, dropping ones it doesn't take.
 
@@ -523,10 +652,14 @@ def build_backend(name: str, **kw) -> LLMBackend:
     """
     match name:
         case "transformers":
-            kw.pop("filename", None)
+            for k in ("filename", *_SERVER_KEYS):
+                kw.pop(k, None)
             return TransformersBackend(**kw)
         case "llamacpp":
             return LlamaCppBackend(**kw)
+        case "openai":
+            kw.pop("filename", None)
+            return OpenAIBackend(**kw)
         case "echo":
             return EchoBackend(**kw)
         case _:
