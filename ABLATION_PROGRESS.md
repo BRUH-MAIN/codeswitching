@@ -75,9 +75,11 @@ Dev MER by checkpoint, large-v2 full (same decoder as test):
 | MER | 53.2 | **46.2** | 46.6 | 58.8 | 63.0 | 57.8 | 58.5 | 58.6 | 57.8 |
 | % Latin | 16.9 | 19.1 | 20.2 | 10.4 | 4.9 | 9.6 | 8.7 | 8.5 | 9.9 |
 
-Every run has this shape (`results/ablation/fig_dev_curves.png`): a sharp gain at
-step 50–100, then by step 200–400 the model is worse than zero-shot and stays there,
-with the Latin share collapsing to the 9% of the synthetic Hindi-matrix text. Step 50
+Every run has this shape (`results/ablation/figures/D1_training_length_by_model.png`):
+a sharp gain at step 50–100, then the error rate climbs back by step 200–400. For
+Whisper medium and large-v2 (all methods) it ends above zero-shot; Whisper small and
+MMS-1B full end below their zero-shot level but far above their step-50 best. The
+Latin share collapses toward the 9% of the synthetic Hindi-matrix text. Step 50
 is 3,200 utterances (0.19 epoch) with the learning rate still in warm-up (5e-6).
 
 ### Findings worth a slide
@@ -200,6 +202,7 @@ the same seed), so this is one sample, not four. Options, cheapest first:
 |---|---|
 | Runner (3-day walltime, self-resubmitting, lock + `.done` per unit) | `scripts/ablate.sh` |
 | Results: one row per run, test hypotheses, report, CSV, figures | `results/ablation/` (`rows/`, `hyps/`, `report.md`, `ablation.csv`, `fig_*.png`, `text_stats.json`) |
+| Labelled figures, one per axis and metric (A ASR model, B fine-tuning method, C LLM/prompt, D training length, S all runs) | `results/ablation/figures/*.png`, built by `scripts/ablation_figures.py` (`~/.venvs/csasr-abl/bin/python3 scripts/ablation_figures.py`; rerun after the report) |
 | Run directories (selected checkpoint, dev curves, `run_meta.json`) | `csasr-work/abl/<corpus>__<asr>__<ft>[__tag]/` |
 | New corpora: text, LLM response caches, 16 kHz audio, 22 h manifest | `data/ablation/{g31,s30,g31m}/` (`train.jsonl`, `audio/`, `sentences.jsonl`, `cache/`) |
 | Existing corpus's 22 h subset | `data/ablation/g26/ids.json` |
