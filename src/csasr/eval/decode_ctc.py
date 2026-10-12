@@ -24,7 +24,7 @@ from ..manifest import write_jsonl
 from .decode import SR, _concat_audio, _load_rows, _progress
 from .grouping import group_by_recording
 
-__all__ = ["windows", "main"]
+__all__ = ["windows", "ctc_transcribe", "main"]
 
 #: wav2vec2's convolutional stack emits one frame per 320 samples (20 ms).
 FRAME = 320
@@ -48,6 +48,32 @@ def windows(n: int, chunk: int, stride: int) -> list[tuple[int, int, int, int]]:
         if last:
             return out
         start += step
+
+
+def ctc_transcribe(audio: np.ndarray, model, processor, device, dtype, *,
+                   chunk: int, stride: int, batch_size: int = 16) -> str:
+    """Greedy CTC over one recording: overlapping windows, stitched frames, one decode."""
+    import torch
+
+    wins = windows(len(audio), chunk, stride)
+    ids: list[np.ndarray] = []
+    for b in range(0, len(wins), batch_size):
+        batch = wins[b : b + batch_size]
+        feats = processor.feature_extractor(
+            [audio[s:e] for s, e, _, _ in batch], sampling_rate=SR,
+            return_tensors="pt", padding=True, return_attention_mask=True,
+        )
+        with torch.inference_mode():
+            logits = model(feats.input_values.to(device, dtype),
+                           attention_mask=feats.attention_mask.to(device)).logits
+        pred = logits.argmax(-1).cpu().numpy()
+        for (s, e, dl, dr), p in zip(batch, pred):
+            n_frames = int(model._get_feat_extract_output_lengths(torch.tensor(e - s)))
+            p = p[:n_frames]  # drop the frames that are batch padding
+            ids.append(p[dl // FRAME : len(p) - dr // FRAME])
+    # One decode over the stitched frames, so a character repeated across a
+    # window join collapses the way it would inside a window.
+    return processor.tokenizer.decode(np.concatenate(ids)) if ids else ""
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -100,25 +126,8 @@ def main(argv: list[str] | None = None) -> int:
     out = []
     for reco, group in _progress(sorted(groups.items()), desc="decode", unit="rec"):
         audio = _concat_audio(group)
-        wins = windows(len(audio), chunk, stride)
-        ids: list[np.ndarray] = []
-        for b in range(0, len(wins), args.batch_size):
-            batch = wins[b : b + args.batch_size]
-            feats = processor.feature_extractor(
-                [audio[s:e] for s, e, _, _ in batch], sampling_rate=SR,
-                return_tensors="pt", padding=True, return_attention_mask=True,
-            )
-            with torch.inference_mode():
-                logits = model(feats.input_values.to(device, dtype),
-                               attention_mask=feats.attention_mask.to(device)).logits
-            pred = logits.argmax(-1).cpu().numpy()
-            for (s, e, dl, dr), p in zip(batch, pred):
-                n_frames = int(model._get_feat_extract_output_lengths(torch.tensor(e - s)))
-                p = p[:n_frames]  # drop the frames that are batch padding
-                ids.append(p[dl // FRAME : len(p) - dr // FRAME])
-        # One decode over the stitched frames, so a character repeated across a
-        # window join collapses the way it would inside a window.
-        text = processor.tokenizer.decode(np.concatenate(ids)) if ids else ""
+        text = ctc_transcribe(audio, model, processor, device, dtype,
+                              chunk=chunk, stride=stride, batch_size=args.batch_size)
         out.append({"utt_id": reco, "hyp": text.strip(), "n_segments": len(group),
                     "dur": float(len(audio) / SR)})
 

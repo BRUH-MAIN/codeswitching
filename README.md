@@ -96,6 +96,30 @@ times at once: each unit of work is locked and marked done, so concurrent jobs
 split the study across GPUs. Results land in `results/ablation/` (`report.md`,
 `ablation.csv`, figures). Outcome and caveats: [`ABLATION_PROGRESS.md`](ABLATION_PROGRESS.md).
 
+### Demo of the trained models
+
+`python -m csasr.demo` shows what the fine-tuned models can do, using the checkpoint the
+ablation selected for each (step 50–100, not the over-trained last one). English-script
+words are highlighted, so a model that writes English terms in Devanagari is visible at a
+glance.
+
+```bash
+python -m csasr.demo models                       # every demo model, its test MER and CBA-HE
+python -m csasr.demo showcase                     # instant, no GPU: stored test transcripts
+python -m csasr.demo samples --models quick       # live: MUCS test excerpts, with audio report
+python -m csasr.demo transcribe talk.wav --models medium-qlora zeroshot-medium
+sbatch scripts/demo.sh                            # the large-v2 comparison on an A100
+```
+
+Models are short keys (`medium-qlora`, `large-sarvam30`, `zeroshot-large`) or presets
+(`quick`, `methods`, `asr`, `story`, `all`, `best`). `samples` cuts about 25 s runs of
+consecutive segments out of a test recording, because the models were evaluated on whole
+recordings and isolated 6 s clips lose the context code-switching needs. Each command
+prints the transcripts and writes a self-contained HTML report to `results/demo/`
+(audio players, per-clip MER, English-word share, switch counts). The login node's GPUs are
+only used inside a SLURM allocation; elsewhere the demo runs on CPU. The first load of a
+fine-tuned model converts it into `ct2_models/`, which takes a few minutes.
+
 What differs from the M6/M7/M8 runs above, and why:
 
 * **Checkpoints are selected after training, with the test decoder**
